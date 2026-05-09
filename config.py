@@ -1,6 +1,7 @@
 # config.py 自定义配置,包括阅读次数、推送token的填写
 import os
 import re
+import json
 
 """
 可修改区域
@@ -9,7 +10,8 @@ import re
 
 # 阅读次数 默认40次/20分钟
 READ_NUM = int(os.getenv('READ_NUM') or 40)
-# 需要推送时可选，可选pushplus、wxpusher、telegram
+# 需要推送时可选，可选 pushplus、wxpusher、telegram、serverchan、feishu
+# 支持多个渠道，使用英文逗号分隔，例如：feishu,pushplus
 PUSH_METHOD = "" or os.getenv('PUSH_METHOD')
 # pushplus推送时需填
 PUSHPLUS_TOKEN = "" or os.getenv("PUSHPLUS_TOKEN")
@@ -20,9 +22,11 @@ TELEGRAM_CHAT_ID = "" or os.getenv("TELEGRAM_CHAT_ID")
 WXPUSHER_SPT = "" or os.getenv("WXPUSHER_SPT")
 # SeverChan推送时需填
 SERVERCHAN_SPT = "" or os.getenv("SERVERCHAN_SPT")
+# 飞书机器人推送时需填
+FEISHU_WEBHOOK = "" or os.getenv("FEISHU_WEBHOOK")
 
 
-# read接口的bash命令，本地部署时可对应替换headers、cookies
+# read接口的bash命令，本地部署时可对应替换headers、cookies、data
 curl_str = os.getenv('WXREAD_CURL_BASH')
 
 # headers、cookies是一个省略模版，本地或者docker部署时对应替换
@@ -81,9 +85,27 @@ data = {
 }
 
 
+def extract_curl_data(curl_command):
+    """提取 curl 中的 data/json 数据"""
+    data_match = (
+        re.search(r"--data-raw '([^']+)'", curl_command)
+        or re.search(r"--data-binary '([^']+)'", curl_command)
+        or re.search(r"--data '([^']+)'", curl_command)
+    )
+
+    if not data_match:
+        return {}
+
+    raw_data = data_match.group(1).strip()
+    try:
+        return json.loads(raw_data)
+    except json.JSONDecodeError:
+        return {}
+
+
 def convert(curl_command):
-    """提取bash接口中的headers与cookies
-    支持 -H 'Cookie: xxx' 和 -b 'xxx' 两种方式的cookie提取
+    """提取 bash 接口中的 headers、cookies、data
+    支持 -H 'Cookie: xxx' 和 -b 'xxx' 两种方式的 cookie 提取
     """
     # 提取 headers
     headers_temp = {}
@@ -112,7 +134,13 @@ def convert(curl_command):
     headers = {k: v for k, v in headers_temp.items() 
               if k.lower() != 'cookie'}
 
-    return headers, cookies
+    payload = extract_curl_data(curl_command)
+    return headers, cookies, payload
 
 
-headers, cookies = convert(curl_str) if curl_str else (headers, cookies)
+if curl_str:
+    parsed_headers, parsed_cookies, parsed_data = convert(curl_str)
+    headers = parsed_headers or headers
+    cookies = parsed_cookies or cookies
+    if parsed_data:
+        data.update(parsed_data)

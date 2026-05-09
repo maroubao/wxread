@@ -7,7 +7,7 @@
 该脚本具备以下功能：
 
 - **阅读时长调节**：默认计入排行榜和挑战赛，时长可调节，默认为60分钟。
-- **定时运行推送**：可部署在GitHub Action/服务器上，支持每天定时运行并推送结果到微信。
+- **定时运行推送**：可部署在GitHub Action/服务器上，支持每天定时运行并推送结果到微信/飞书等渠道。
 - **Cookie自动更新**：脚本能自动获取并更新Cookie，一次部署后面无需其它操作。
 - **轻量化设计**：本脚本实现了轻量化的编写，部署服务器/GIthub action后到点运行，无需额外硬件。
 
@@ -24,15 +24,15 @@
   "synckey": 564589834
 }
 ```
-右键复制为Bash格式。
+右键复制为Bash格式。脚本会自动从这段 `curl bash` 中提取 `headers`、`cookies` 和请求体里的关键字段，通常不需要再手工改 `config.py` 里的 `data`。
 
 ### 方法一： GitHub Action部署运行（GitHub运行）
 
 
 - Fork这个仓库，在仓库 **Settings** -> 左侧列表中的 **Secrets and variables** -> **Actions**，然后在右侧的 **Repository secrets** 中添加如下值：
   - `WXREAD_CURL_BASH`：上面抓read接口后转换为curl_bash的数据。
-  - `PUSH_METHOD`：推送方法，4选1推送方式（pushplus、wxpusher、telegram、serverChan）。
-  - `PUSHPLUS_TOKEN` or `WXPUSHER_SPT` or `TELEGRAM_BOT_TOKEN`&`TELEGRAM_CHAT_ID` or `SERVERCHAN_SPT`: 选择推送后填写对应token。
+  - `PUSH_METHOD`：推送方法，支持 `pushplus`、`wxpusher`、`telegram`、`serverchan`、`feishu`，也支持多渠道并行，例如 `feishu,pushplus`。
+  - `PUSHPLUS_TOKEN` or `WXPUSHER_SPT` or `TELEGRAM_BOT_TOKEN`&`TELEGRAM_CHAT_ID` or `SERVERCHAN_SPT` or `FEISHU_WEBHOOK`: 选择推送后填写对应配置。
   
 - 在 **Variables** 部分，最下方添加变量：
   - `READ_NUM`：设定每次阅读的目标次数。
@@ -44,11 +44,12 @@
 | ------------------------- | ---------------------------------- | ------------------------------------------------------------ | --------- |
 | `WXREAD_CURL_BASH`         | `read` 接口 `curl_bash`数据 | **必填**，必须提供有效指令                                   | secrets   |
 | `READ_NUM`                 | 阅读次数（每次 30 秒）              | **可选**，阅读时长，默认 20 分钟                           | variables |
-| `PUSH_METHOD`              | `pushplus`/`wxpusher`/`telegram`/`serverchan`    | **可选**，推送方式，4选1，默认不推送                                       |    secrets     |
+| `PUSH_METHOD`              | `pushplus`/`wxpusher`/`telegram`/`serverchan`/`feishu` 或逗号组合    | **可选**，推送方式，支持单个或多个渠道，默认不推送                                       |    secrets     |
 | `PUSHPLUS_TOKEN`           | PushPlus 的 token                   | 当 `PUSH_METHOD=pushplus` 时必填，[获取地址](https://www.pushplus.plus/uc.html) | secrets   |
 | `WXPUSHER_SPT`             | WxPusher 的token                    | 当 `PUSH_METHOD=wxpusher` 时必填，[获取地址](https://wxpusher.zjiecode.com/docs/#/?id=获取spt) | secrets   |
 | `TELEGRAM_BOT_TOKEN`  <br>`TELEGRAM_CHAT_ID`   <br>`http_proxy`/`https_proxy`（可选）| 群组id以及机器人token                 | 当 `PUSH_METHOD=telegram` 时必填，[配置文档](https://www.nodeseek.com/post-22475-1) | secrets   |
 | `SERVERCHAN_SPT`          | serverchan 的 SendKey               | 当 `PUSH_METHOD=serverchan` 时必填，[获取地址](https://sct.ftqq.com/sendkey) | secrets   |
+| `FEISHU_WEBHOOK`          | 飞书机器人的 Webhook 地址               | 当 `PUSH_METHOD` 包含 `feishu` 时必填，在飞书群机器人设置中获取 | secrets   |
 
 **重要：除了READ_NUM配置在varables，其它的都配置在secrets里面的；需要推送`PUSH_METHOD`是必填的。**
 
@@ -77,7 +78,24 @@ steps4：测试：`docker exec -it wxread python /app/main.py`
 
 3. **GitHub Action部署/本地部署**：主要配置config.py即可，Action部署使用环境变量，本地部署修改config.py里的阅读次数、headers、cookies即可。
 
-4. **推送**：pushplus推送偶尔出问题，猜测是GitHub action环境问题，增加重试机制。并增加wxpusher的极简推送方式。
+4. **推送**：pushplus推送偶尔出问题，猜测是GitHub action环境问题，增加重试机制。并增加wxpusher的极简推送方式，同时支持飞书机器人推送和多渠道并行通知。
+5. **read 接口失效处理**：当前版本会优先使用 `WXREAD_CURL_BASH` 中最新抓包的请求体字段，减少因为 `data/appId/ps/pc/ci/co/sm/pr` 过期导致的失效问题。
+
+### 飞书机器人配置示例
+
+如果你希望每次任务完成后通过飞书提醒：
+
+1. 在飞书群中添加**自定义机器人**。
+2. 复制机器人的 `Webhook` 地址。
+3. 在 GitHub Actions 的 `Secrets` 中新增：
+   - `PUSH_METHOD=feishu`
+   - `FEISHU_WEBHOOK=https://open.feishu.cn/open-apis/bot/v2/hook/xxxx`
+
+如果你希望同时发到多个渠道，例如飞书 + PushPlus：
+
+```text
+PUSH_METHOD=feishu,pushplus
+```
 
 
 ***
