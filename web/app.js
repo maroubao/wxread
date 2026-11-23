@@ -25,6 +25,7 @@ const QR_POLL_MS = 4000;
 const QR_BUDGET_MS = 15 * 60 * 1000;
 const RECEIPT_POLL_MS = 3000;
 const RECEIPT_TRIES = 100; // 5 分钟：够 control.yml 启动 + 二维码登录窗口
+const RUN_POLL_MS = 5000;
 
 // ---------------------------------------------------------------- 小工具
 
@@ -372,6 +373,67 @@ async function askQr() {
   pollQr().catch(() => {});
 }
 
+// ---------------------------------------------------------------- 手动运行
+
+const RUN_STATE = { queued: "排队中", in_progress: "进行中", waiting: "等待中", completed: "结束" };
+const RUN_VERDICT = {
+  success: "成功",
+  failure: "失败",
+  cancelled: "已取消",
+  timed_out: "超时",
+  skipped: "跳过",
+};
+
+function numberOrZero(id) {
+  const value = Number($(id).value);
+  return Number.isFinite(value) && value > 0 ? Math.round(value) : 0;
+}
+
+async function startRun(workflow, inputs, noun) {
+  const startedAt = Date.now();
+  try {
+    await gh.dispatchWorkflow(state.cfg, workflow, inputs);
+  } catch (error) {
+    say(`${noun}触发失败：${error.message}`, "bad");
+    return;
+  }
+  say(`已触发 ${workflow}，正在等它出现在运行列表里…`, "ok");
+  trackRun(workflow, startedAt, noun).catch((error) => say(`跟踪${noun}状态失败：${error.message}`, "warn"));
+}
+
+async function trackRun(workflow, startedAt, noun, tries = 0) {
+  // dispatch 之后 GitHub 要几秒才把这次 run 放进列表，所以按 created_at 找，不按 id 猜。
+  if (tries > 120) {
+    say(`${noun}十分钟还没结束：去 Actions 页面看日志。`, "warn");
+    return;
+  }
+  let runs = [];
+  try {
+    runs = await gh.listRuns(state.cfg, workflow);
+  } catch (error) {
+    say(`查询${noun}状态失败：${error.message}`, "warn");
+    return;
+  }
+  const mine = runs.find((run) => {
+    const created = Date.parse(run.created_at || "");
+    return Number.isFinite(created) && created >= startedAt - 15_000;
+  });
+  if (!mine) {
+    if (tries === 4) say("还没出现在运行列表里：可能还在排队，或 token 少了 actions 权限。", "warn");
+    setTimeout(() => trackRun(workflow, startedAt, noun, tries + 1).catch(() => {}), RUN_POLL_MS);
+    return;
+  }
+  if (mine.status !== "completed") {
+    if (tries % 3 === 0) say(`${noun} #${mine.run_number} ${RUN_STATE[mine.status] || mine.status}…`);
+    setTimeout(() => trackRun(workflow, startedAt, noun, tries + 1).catch(() => {}), RUN_POLL_MS);
+    return;
+  }
+  const verdict = RUN_VERDICT[mine.conclusion] || mine.conclusion || "结束";
+  const ok = mine.conclusion === "success";
+  say(`${noun} #${mine.run_number} ${verdict}。日志：${mine.html_url}`, ok ? "ok" : "bad");
+  if (ok) await refreshAll().catch(() => {});
+}
+
 // ---------------------------------------------------------------- 事件
 
 function bind() {
@@ -381,13 +443,30 @@ function bind() {
   $("btn-qr").addEventListener("click", () => askQr().catch((error) => say(error.message, "bad")));
   $("btn-qr-poll").addEventListener("click", () => pollQr().catch(() => {}));
 
-  $("btn-run").addEventListener("click", async () => {
-    try {
-      await gh.dispatchWorkflow(state.cfg, "read.yml", {});
-      say("已触发 read.yml。", "ok");
-    } catch (error) {
-      say(`触发失败：${error.message}`, "bad");
+  const runRead = () => {
+    const inputs = {};
+    const pace = numberOrZero("inp-pace");
+    const deadline = numberOrZero("inp-deadline");
+    if (pace) inputs.pace = String(pace);
+    if (deadline) inputs.deadline = String(deadline);
+    startRun("read.yml", inputs, "阅读任务");
+  };
+  $("btn-run").addEventListener("click", runRead);
+  $("btn-run-now").addEventListener("click", runRead);
+  $("btn-warm-now").addEventListener("click", () => startRun("warm.yml", {}, "保活任务"));
+
+  $("btn-import").addEventListener("click", async () => {
+    const curl = $("inp-curl").value.trim();
+    if (!curl) {
+      say("先把 cURL 贴进上面的框里。", "warn");
+      return;
     }
+    const payload = { curl };
+    const label = $("inp-curl-label").value.trim();
+    if (label) payload.label = label.slice(0, 24);
+    const target = numberOrZero("inp-curl-target");
+    if (target) payload.target_count = target;
+    await sendInstruction("import", payload);
   });
 
   $("btn-stop").addEventListener("click", async () => {

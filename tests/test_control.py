@@ -76,6 +76,25 @@ def test_init_is_idempotent_and_imports_account(store: StateStore):
     assert store.load_account(imported["account_id"]) is not None
 
 
+def test_import_twice_merges_into_the_same_account(store: StateStore):
+    """扫码绑过的账户再导入 curl：要合并到同一条，不能因为 merge 返回 None 崩掉。"""
+    ctx = make_store(store)
+    first = control.execute(ctx, instr("import", {"curl": CURL_SAMPLE, "label": "主号"}, sid="l" * 32))
+    assert first["ok"] and first["updated"] is False
+
+    again = control.execute(
+        ctx,
+        instr("import", {"curl": CURL_SAMPLE, "label": "主号改", "target_count": 12}, sid="m" * 32),
+    )
+
+    assert again["ok"] is True
+    assert again["updated"] is True
+    assert again["account_id"] == first["account_id"]
+    stored = store.load_account(first["account_id"])
+    assert stored["label"] == "主号改"
+    assert stored["target_count"] == 12
+
+
 def test_update_validates_status_and_target(store: StateStore):
     ctx = make_store(store)
     imported = control.execute(ctx, instr("import", {"curl": CURL_SAMPLE}, sid="g" * 32))

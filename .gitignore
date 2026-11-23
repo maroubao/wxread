@@ -16,6 +16,11 @@ qr-out/
 probe-*.png
 probe-*.py.tmp
 
+# F12 复制出来的 curl 里带整条 cookie，等于密码
+curl.txt
+*.curl.txt
+curl-*.txt
+
 # 依赖与虚拟环境
 .venv/
 venv/

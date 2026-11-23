@@ -35,3 +35,17 @@ def test_crypto_js_fails_loud_when_nacl_is_absent():
     source = (WEB / "crypto.js").read_text(encoding="utf-8")
     assert "globalThis.nacl" in source
     assert "tweetnacl 未加载" in source
+
+
+def test_every_element_app_js_touches_exists_in_the_page():
+    """app.js 里 $(...) 抓的每个 id 都必须在 index.html 里存在。
+
+    回归来源：`$("btn-run-now").addEventListener(...)` 这类新按钮如果只改了 js
+    没改 HTML，页面会在 bind() 阶段抛 `Cannot read properties of null`，整页按钮全失效。
+    """
+    html = (WEB / "index.html").read_text(encoding="utf-8")
+    source = (WEB / "app.js").read_text(encoding="utf-8")
+    ids = set(re.findall(r'\$\("([a-z0-9-]+)"\)', source))
+    assert ids, "app.js 里没有 $() 选择器"
+    missing = sorted(identifier for identifier in ids if f'id="{identifier}"' not in html)
+    assert missing == [], f"index.html 缺少这些 id：{missing}"

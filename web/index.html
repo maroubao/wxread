@@ -99,6 +99,33 @@
         </div>
       </section>
 
+      <section aria-labelledby="curl-title">
+        <h2 id="curl-title">导入 cURL</h2>
+        <div class="card">
+          <label class="field">
+            <span>在 weread.qq.com 里随便读一本书，F12 → Network 过滤 <code>read</code> → 右键那条请求 → Copy as cURL，整段贴进来</span>
+            <textarea id="inp-curl" rows="5" spellcheck="false" placeholder="curl 'https://weread.qq.com/web/book/read' -H 'cookie: wr_vid=...; wr_skey=...' --data-raw '{&quot;appId&quot;:...}'"></textarea>
+          </label>
+          <div class="cols">
+            <label class="field">
+              <span>账户备注（≤24 字）</span>
+              <input type="text" id="inp-curl-label" maxlength="24" placeholder="主号" />
+            </label>
+            <label class="field">
+              <span>目标阅读次数</span>
+              <input type="number" id="inp-curl-target" min="1" max="200" value="40" />
+            </label>
+          </div>
+          <div class="actions">
+            <button type="button" class="primary" id="btn-import">导入 / 更新 payload</button>
+          </div>
+          <p class="sub" style="color: var(--text-3); font-size: var(--fs-xs); margin: var(--sp-3) 0 0">
+            扫码只拿到 cookie，<code>appId / ps / pc</code> 要由这条 curl 提供；同一个 <code>wr_vid</code>
+            会合并到已绑定的那个账户，不用重新扫码。
+          </p>
+        </div>
+      </section>
+
       <section aria-labelledby="acc-title">
         <h2 id="acc-title">账户 <span class="count" id="acc-count"></span></h2>
         <table>
@@ -161,6 +188,20 @@
       <section aria-labelledby="run-title">
         <h2 id="run-title">最近运行</h2>
         <div class="card">
+          <div class="cols">
+            <label class="field">
+              <span>每次间隔（秒，0=服务器默认）</span>
+              <input type="number" id="inp-pace" min="0" max="30" value="3" />
+            </label>
+            <label class="field">
+              <span>单次截止（秒，0=服务器默认）</span>
+              <input type="number" id="inp-deadline" min="0" max="1800" value="300" />
+            </label>
+          </div>
+          <div class="actions">
+            <button type="button" class="primary" id="btn-run-now">按上面的参数试读</button>
+            <button type="button" id="btn-warm-now">保活一次</button>
+          </div>
           <div class="bars" id="run-bars" role="img" aria-label="最近 14 天读取量"></div>
           <div class="legend"><span><span class="dot run"></span> 今天</span><span>过去 14 天</span></div>
           <ol class="runs" id="run-list"><li class="sub">连接后显示运行记录</li></ol>

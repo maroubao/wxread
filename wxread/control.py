@@ -180,13 +180,32 @@ def handle_qr(ctx: ControlContext, payload: Mapping[str, Any]) -> dict:
         account.mark_renewed(cookies.get("wr_skey", ""), ctx.now_iso())
         existing = ctx.store.load_account(account.id)
         if existing:
-            merged = Account.from_dict(existing).merge(account)
+            merged = _merge_accounts(existing, account)
             ctx.store.save_account(merged.to_dict(), message="control: qr rebind")
         else:
             ctx.store.save_account(account.to_dict(), message="control: qr bind")
         return {"ok": True, "account_id": account.id, "label": account.label, "rebound": bool(existing)}
     finally:
         page.close()
+
+
+def _merge_accounts(
+    existing: Mapping[str, Any],
+    fresh: Account,
+    *,
+    keep_label: bool = True,
+    take_target: bool = False,
+) -> Account:
+    """把新解码出来的账户合到已存的账户上。
+
+    `Account.merge()` 是原地改 self 并返回 None，直接 `account = x.merge(y)` 会拿到 None，
+    后面 `.to_dict()` 就炸——这就是 import 报 `'NoneType' object has no attribute 'to_dict'` 的原因。
+    """
+    base = Account.from_dict(existing)
+    base.merge(fresh, keep_label=keep_label)
+    if take_target:
+        base.target_count = fresh.target_count
+    return base
 
 
 def handle_import(ctx: ControlContext, payload: Mapping[str, Any]) -> dict:
@@ -201,7 +220,13 @@ def handle_import(ctx: ControlContext, payload: Mapping[str, Any]) -> dict:
     )
     existing = ctx.store.load_account(account.id)
     if existing:
-        account = Account.from_dict(existing).merge(account)
+        # 用户显式导入：给了备注/目标就以这次为准，没给的沿用账户上的值
+        account = _merge_accounts(
+            existing,
+            account,
+            keep_label=not payload.get("label"),
+            take_target=bool(payload.get("target_count")),
+        )
     ctx.store.save_account(account.to_dict(), message="control: import")
     return {"ok": True, "account_id": account.id, "label": account.label, "updated": bool(existing)}
 
