@@ -41,17 +41,18 @@ control.yml  手动/页面 ─┘                 accounts/ settings/ runs/ resp
 | `wxread/` | 运行时：`crypto` `state` `accounts` `reader` `jobs` `worker` `qr` `control` `notify` `warm` `logsafe` |
 | `web/` | 控制台（零构建）：`index.html` `app.js` `crypto.js` `gh.js` `style.css` |
 | `docs/` | `ARCHITECTURE.md` `THREAT-MODEL.md` `DESIGN.md` `RUNBOOK.md` `REVIEW.md` `design/` `reviews/` |
-| `tests/` | pytest（102 个）+ `tests/js/` 跨语言加密互通测试（4 个） |
+| `tests/` | pytest（104 个）+ `tests/js/` 跨语言加密互通测试（4 个） |
 | `.github/workflows/` | `read.yml` `warm.yml` `control.yml` `tests.yml` `pages.yml` |
 
 ## 本地开发
 
 ```bash
 pip install -r requirements.txt pytest
-python -m pytest tests -q                 # 102 passed
+python -m pytest tests -q                 # 104 passed
 node --test tests/js/crypto.test.mjs      # 4 passed
 python scripts/scan_secrets.py            # 明文密钥扫描（CI 同款）
 python scripts/qr_local.py --wait 300     # 本机真扫码，写 .qr-cookies.json（已 gitignore）
+python scripts/control_local.py --help    # 本机下发密文指令：import curl / 通知口令
 ```
 
 ## 与旧版（v3）的差异

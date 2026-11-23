@@ -44,9 +44,19 @@ warm.yml  (每 6 小时)       --> worker warm  --> 只更新 accounts/*.enc.jso
 5. **绑定第一个账户**（二选一）：
 
    - **扫码**：打开 Pages 站点 → 填仓库、token、状态密钥 → 点"连接并保存" → "生成二维码" → 微信扫。
-   - **导入 curl**：浏览器 F12 → Network → 复制 `web/book/read` 请求为 cURL → 控制台"导入"。
+   - **导入 curl**：浏览器 F12 → Network → 复制 `web/book/read` 请求为 cURL → 用本机脚本导入（见下）。
 
    扫码拿到的账户只有 cookie，缺 `appId/ps/pc`（**必须**再导入一次 curl 才有阅读参数），控制台会把 `note` 标成"扫码账户未带 ps/pc"。
+
+   导入用 `scripts/control_local.py`（终端下发密文指令，与网页按钮等价）：
+
+   ```bash
+   export GITHUB_TOKEN=<fine-grained: contents 读写 + actions 读写>
+   python scripts/control_local.py import --repo <owner>/<repo> \
+     --payload-json '{"curl":"<粘贴整段 cURL>","label":"主号","target_count":40}'
+   ```
+
+   cURL 太长就先存文件：`--payload-file import.json`（`{"curl": "...", "label": "主号"}`）。
 
 6. **第一条真跑**（见 §5 G3 清单）。
 
@@ -59,6 +69,7 @@ warm.yml  (每 6 小时)       --> worker warm  --> 只更新 accounts/*.enc.jso
 | 关掉自动运行 | 控制台"计划"取消勾选，或直接 `schedule` 指令 `enabled: false`（cron 仍在，但 worker 开头就退出 0） |
 | 改保活间隔 | `schedule` 指令 `warm_hours: 0/1/3/6/12`；`0` 等于关闭（workflow 仍每 6 小时跑一次，只是空转） |
 | 加账户 | 再来一次扫码或导入 |
+| 填通知口令（SMTP/webhook/bot token） | 网页只能开关渠道，口令用脚本：`python scripts/control_local.py notifications --payload-json '{"enabled":true,"channels":["email"],"email":{"host":"smtp.qq.com","port":465,"user":"a@qq.com","password":"授权码","to":"a@qq.com"}}'` |
 | 停用某账户 | 账户行"停用"（`update enabled: false`），该账户不再参与 read/warm |
 
 ## 3. 故障处置
@@ -123,7 +134,7 @@ python scripts/live_check.py
 | 1 | `control.yml` `init` | 日志出现 `public_key`；状态分支出现 `control.json` |
 | 2 | 控制台连接 | 头部 chip 变"已连接"，账户区显示空状态而不是报错 |
 | 3 | 扫码（真实微信） | 账户出现且 `status=ok`；`renewed_at` 有值 |
-| 4 | 导入 curl | 同一账户 `read_payload` 补齐 `appId/ps/pc/ci/co`，`note` 清空 |
+| 4 | 导入 curl | 同账户 `read_payload` 补齐 `appId/ps/pc/ci/co`，`note` 清空（`scripts/control_local.py import`） |
 | 5 | 手动 `read.yml`（`pace=3`，`target_count=3`） | `runs/` 出现记录，`read_count=3`，`succ` 分布在日志里，退出码 0 |
 | 6 | 每日定时 | 次日 01:07 后 `runs/` 有当天记录 |
 | 7 | `warm.yml` 手动 | 账户 `renewed_at` 前移，`wr_skey` 变化（8 位短码可能不变，看 `renewed_at`） |
@@ -136,9 +147,10 @@ python scripts/live_check.py
 ## 6. 本地开发
 
 ```bash
-python -m pytest tests -q                 # 102 passed
+python -m pytest tests -q                 # 104 passed
 node --test tests/js/crypto.test.mjs      # 4 passed（跨语言加密互通）
 python scripts/scan_secrets.py            # 明文密钥扫描
 python scripts/qr_local.py --wait 300     # 本机真扫码（写 .qr-cookies.json，已 gitignore）
+python scripts/control_local.py --help    # 本机下发密文指令（import / notifications 等）
 python -m wxread.worker read --verbose    # 需要 GITHUB_* 与 WXREAD_STATE_KEY
 ```
