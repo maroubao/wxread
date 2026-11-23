@@ -17,7 +17,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, Mapping, Protocol
 
-from .accounts import Account, account_from_curl, derive_account_id  # noqa: F401  (re-export 给调用方)
+from .accounts import Account, derive_account_id
 from .logsafe import mask
 
 LOGIN_URL = "https://weread.qq.com/"

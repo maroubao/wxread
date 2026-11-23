@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from typing import Callable, Iterable
 
 from .accounts import STATUS_OK, Account
-from .reader import DEFAULT_DEADLINE, DEFAULT_PACE, Outcome, Reader
+from .reader import DEFAULT_DEADLINE, DEFAULT_PACE, Reader
 from .state import StateError, StateStore, utcnow_iso
 
 log = logging.getLogger("wxread.jobs")

@@ -3,14 +3,12 @@
 from __future__ import annotations
 
 import base64
-import os
 
 import pytest
 
 from wxread import worker
-from wxread.accounts import Account, account_from_curl
+from wxread.accounts import account_from_curl
 from wxread.jobs import JobRunner
-from wxread.state import StateStore
 
 from support import CURL_SAMPLE, MemoryContents
 from test_reader import FakeTransport, ok
@@ -42,7 +40,6 @@ def test_runner_skips_disabled_and_needs_login():
     active.target_count = 1
     pending = account_from_curl(CURL_SAMPLE.replace("wr_vid=1234567890", "wr_vid=1111111111"))
     pending.mark_needs_login("cookie 失效")
-    calls: list[str] = []
     runner = JobRunner(store, transport_factory=lambda: FakeTransport([ok()]), pace=0, sleep=lambda _s: None)
     records = runner.run([active, pending])
     assert len(records) == 1

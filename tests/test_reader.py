@@ -5,8 +5,6 @@ from __future__ import annotations
 import hashlib
 import random
 
-import pytest
-
 from wxread.accounts import account_from_curl
 from wxread.reader import (
     BACKOFF,
@@ -14,7 +12,6 @@ from wxread.reader import (
     READ_URL,
     RENEW_URL,
     Reader,
-    SessionInvalid,
     TransportError,
     TransportResponse,
     build_payload,
