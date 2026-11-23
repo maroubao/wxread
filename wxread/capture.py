@@ -15,7 +15,7 @@ import json
 import logging
 from typing import Any, Mapping
 
-from .accounts import PROMOTED_PAYLOAD_FIELDS, REQUIRED_PAYLOAD_FIELDS
+from .accounts import PROMOTED_PAYLOAD_FIELDS, REQUIRED_PAYLOAD_FIELDS, normalize_read_payload
 
 log = logging.getLogger(__name__)
 
@@ -62,15 +62,15 @@ def parse_read_body(body: str | None) -> dict[str, Any] | None:
     return parsed
 
 
-def promoted(payload: Mapping[str, Any] | None) -> dict[str, str]:
+def promoted(payload: Mapping[str, Any] | None) -> dict[str, Any]:
     """只留账户里用得上的基础字段（与 curl 导入保持一致）。"""
     if not payload:
         return {}
-    return {
-        key: str(payload[key])
+    return normalize_read_payload({
+        key: payload[key]
         for key in PROMOTED_PAYLOAD_FIELDS
         if payload.get(key) is not None and str(payload[key]).strip()
-    }
+    })
 
 
 def accepted_headers(headers: Mapping[str, str] | None) -> dict[str, str]:
@@ -113,7 +113,7 @@ class ReadSniffer:
         return dict(self._payload)
 
     @property
-    def read_payload(self) -> dict[str, str]:
+    def read_payload(self) -> dict[str, Any]:
         return promoted(self._payload)
 
     @property

@@ -18,7 +18,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Protocol
 
-from .accounts import Account, derive_account_id
+from .accounts import Account, derive_account_id, normalize_read_payload
 from .capture import BOOK_LINK_SELECTORS, SHELF_URL, ReadSniffer
 from .logsafe import mask
 
@@ -237,7 +237,7 @@ class ChromeLoginPage:
         jar = self._page.context.cookies()
         return {item["name"]: item["value"] for item in jar if item.get("name")}
 
-    def capture_read_payload(self, timeout: float = 90.0) -> tuple[dict[str, str], dict[str, str]]:
+    def capture_read_payload(self, timeout: float = 90.0) -> tuple[dict[str, Any], dict[str, str]]:
         """登录态下打开一本书，抓站点自己发的 `web/book/read`，返回 (read_payload, headers)。
 
         抓不到就返回 ({}, {})，由调用方退回"提醒用户导入 curl"的旧路径。
@@ -384,7 +384,7 @@ def account_from_cookies(
     headers: Mapping[str, str] | None = None,
     label: str = "",
     target_count: int = 40,
-    payload: Mapping[str, str] | None = None,
+    payload: Mapping[str, Any] | None = None,
     now_iso: str = "",
 ) -> Account:
     """把扫码得到的 cookie 组装成 Account；缺 ps/pc 时留空并打 note 提示补全。"""
@@ -393,7 +393,7 @@ def account_from_cookies(
         label=label,
         cookies={k: v for k, v in cookies.items() if k in {"wr_vid", "wr_skey", "pac_uid"} or k.startswith("wr_")},
         headers=dict(headers or {}),
-        read_payload={k: str(v) for k, v in (payload or {}).items() if v},
+        read_payload=normalize_read_payload({k: v for k, v in (payload or {}).items() if v is not None and str(v).strip()}),
         target_count=target_count,
         enabled=True,
         status="ok",

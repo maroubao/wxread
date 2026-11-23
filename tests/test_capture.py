@@ -60,7 +60,7 @@ def test_sniffer_promotes_only_account_fields_and_drops_transport_headers():
     sniffer.feed("https://weread.qq.com/web/book/readingProgress", "POST", READ_BODY, BROWSER_HEADERS)
     payload = sniffer.read_payload
     assert set(payload) == {"appId", "ps", "pc", "ci", "co", "sm", "pr", "b", "c"}
-    assert all(isinstance(value, str) for value in payload.values())
+    assert payload["ci"] == 27 and payload["co"] == 389 and payload["pr"] == 74
     assert "ts" not in payload
 
     headers = sniffer.headers
@@ -150,3 +150,41 @@ def test_rebind_clears_the_stale_missing_payload_note(store: StateStore):
     stored = store.load_account(again["account_id"])
     assert stored["note"] == ""
     assert stored["read_payload"]["ps"] == "4ee326507a65a465g015fae"
+
+
+def test_qr_preserves_numeric_and_zero_fields(store: StateStore):
+    class ZeroOffsetPage(CapturingPage):
+        def capture_read_payload(self):
+            return capture.promoted(json.loads(READ_BODY) | {"co": 0, "pr": 0}), {}
+
+    receipt = control.handle_qr(make_ctx(store, ZeroOffsetPage()), {})
+    payload = store.load_account(receipt["account_id"])["read_payload"]
+    assert payload["ci"] == 27
+    assert payload["co"] == 0
+    assert payload["pr"] == 0
+
+
+def test_qr_saves_cookie_rotated_during_payload_capture(store: StateStore):
+    class RotatingPage(CapturingPage):
+        captured = False
+
+        def capture_read_payload(self):
+            self.captured = True
+            return super().capture_read_payload()
+
+        def cookies(self):
+            cookies = super().cookies()
+            if self.captured:
+                cookies["wr_skey"] = "rotated-after-login"
+            return cookies
+
+    receipt = control.handle_qr(make_ctx(store, RotatingPage()), {})
+    assert store.load_account(receipt["account_id"])["cookies"]["wr_skey"] == "rotated-after-login"
+
+
+def test_incomplete_qr_account_can_be_renamed_and_disabled(store: StateStore):
+    ctx = make_ctx(store, QrOnlyPage())
+    receipt = control.handle_qr(ctx, {})
+    control.handle_update(ctx, {"account_id": receipt["account_id"], "label": "稍后补全", "enabled": False})
+    saved = store.load_account(receipt["account_id"])
+    assert saved["label"] == "稍后补全" and saved["enabled"] is False

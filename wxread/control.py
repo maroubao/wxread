@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping
 
 from . import notify, qr
-from .accounts import Account, account_from_curl, clamp_target_count
+from .accounts import Account, account_from_curl, clamp_target_count, normalize_read_payload
 from .crypto import CryptoFailure, b64d, b64e, seal, unseal
 from .logsafe import scrub
 from .state import StateError, StateStore, utcnow_iso
@@ -173,8 +173,9 @@ def handle_qr(ctx: ControlContext, payload: Mapping[str, Any]) -> dict:
         cookies = page.cookies()
         payload_defaults = dict(payload.get("read_payload") or {})
         captured, capture_headers = _capture_read_payload(page)
+        cookies.update(page.cookies())
         read_payload = dict(payload_defaults)
-        read_payload.update({k: v for k, v in captured.items() if v})
+        read_payload.update({k: v for k, v in captured.items() if v is not None and str(v).strip()})
         headers = {"User-Agent": page.user_agent()}
         headers.update(capture_headers)
         account = qr.account_from_cookies(
@@ -186,27 +187,29 @@ def handle_qr(ctx: ControlContext, payload: Mapping[str, Any]) -> dict:
             now_iso=ctx.now_iso(),
         )
         account.mark_renewed(cookies.get("wr_skey", ""), ctx.now_iso())
-        existing = ctx.store.load_account(account.id)
-        if existing:
-            merged = _merge_accounts(existing, account)
-            # 上次扫码留下的"缺 ps/pc"提示，这次抓到参数就该撤掉
-            if merged.read_payload.get("ps") and merged.read_payload.get("pc") and merged.note == qr.PAYLOAD_HINT:
+        rebound = False
+
+        def bind(existing: dict | None) -> dict:
+            nonlocal rebound
+            rebound = existing is not None
+            merged = _merge_accounts(existing, account) if existing is not None else account
+            if merged.read_payload.get("ps") and merged.read_payload.get("pc"):
                 merged.note = ""
-            ctx.store.save_account(merged.to_dict(), message="control: qr rebind")
-        else:
-            ctx.store.save_account(account.to_dict(), message="control: qr bind")
+            return merged.to_dict()
+
+        saved = ctx.store.mutate_account(account.id, bind, "control: qr bind")
         return {
             "ok": True,
             "account_id": account.id,
-            "label": account.label,
-            "rebound": bool(existing),
+            "label": saved["label"],
+            "rebound": rebound,
             "payload_captured": bool(captured),
         }
     finally:
         page.close()
 
 
-def _capture_read_payload(page: Any) -> tuple[dict[str, str], dict[str, str]]:
+def _capture_read_payload(page: Any) -> tuple[dict[str, Any], dict[str, str]]:
     """登录态下顺手把 `web/book/read` 的参数抓回来（抓不到就算了，不打断扫码）。"""
     capture = getattr(page, "capture_read_payload", None)
     if not callable(capture):
@@ -214,7 +217,7 @@ def _capture_read_payload(page: Any) -> tuple[dict[str, str], dict[str, str]]:
     try:
         captured, headers = capture()
     except Exception as exc:  # noqa: BLE001 - 抓包失败只能退回手工补
-        log.warning("自动抓取阅读参数失败：%s", exc)
+        log.warning("自动抓取阅读参数失败：%s", scrub(str(exc)))
         return {}, {}
     if not captured:
         log.warning("自动抓取阅读参数失败：页面没有发出 web/book/read")
@@ -251,17 +254,19 @@ def handle_import(ctx: ControlContext, payload: Mapping[str, Any]) -> dict:
         target_count=clamp_target_count(payload.get("target_count")),
         now=ctx.now_iso(),
     )
-    existing = ctx.store.load_account(account.id)
-    if existing:
-        # 用户显式导入：给了备注/目标就以这次为准，没给的沿用账户上的值
-        account = _merge_accounts(
-            existing,
-            account,
-            keep_label=not payload.get("label"),
-            take_target=bool(payload.get("target_count")),
-        )
-    ctx.store.save_account(account.to_dict(), message="control: import")
-    return {"ok": True, "account_id": account.id, "label": account.label, "updated": bool(existing)}
+    updated = False
+
+    def merge(existing: dict | None) -> dict:
+        nonlocal updated
+        updated = existing is not None
+        fresh = account
+        if existing is not None:
+            fresh = _merge_accounts(existing, account, keep_label=not payload.get("label"), take_target="target_count" in payload)
+        fresh.note = ""
+        return fresh.to_dict()
+
+    saved = ctx.store.mutate_account(account.id, merge, "control: import")
+    return {"ok": True, "account_id": account.id, "label": saved["label"], "updated": updated}
 
 
 def handle_update(ctx: ControlContext, payload: Mapping[str, Any]) -> dict:
@@ -287,8 +292,8 @@ def handle_update(ctx: ControlContext, payload: Mapping[str, Any]) -> dict:
         if "note" in payload:
             account.note = str(payload["note"])[:200]
         if "read_payload" in payload:
-            account.read_payload.update({k: str(v) for k, v in dict(payload["read_payload"]).items() if v})
-        account.validate()
+            account.read_payload.update(normalize_read_payload(payload["read_payload"]))
+            account.validate()
         return account.to_dict()
 
     saved = ctx.store.mutate_account(account_id, update, "control: update")
