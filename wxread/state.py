@@ -231,6 +231,21 @@ class StateStore:
         self.retries = max(1, int(retries))
         if len(state_key) != crypto.STATE_KEY_LEN:
             raise StateError("状态密钥必须是 32 字节")
+        self._branch_ready = False
+
+    # -- 基础设施
+
+    def ensure_ready(self) -> None:
+        """首次写入前确认状态分支存在（GitHub 上首次写文件会因为分支不存在返回 404）。"""
+        if self._branch_ready:
+            return
+        ensure = getattr(self.backend, "ensure_branch", None)
+        if callable(ensure):
+            try:
+                ensure()
+            except StateError as exc:  # 建不出来就让写入自己报错，别掩盖真实原因
+                log.warning("状态分支自动创建失败：%s", exc)
+        self._branch_ready = True
 
     # -- 基础
 
@@ -277,6 +292,7 @@ class StateStore:
         self._cas_write(path, data, message, create_only=create_only, sealed=True)
 
     def _cas_write(self, path: str, data: bytes, message: str, create_only: bool, sealed: bool = False) -> None:
+        self.ensure_ready()
         last_error: Exception | None = None
         for attempt in range(1, self.retries + 1):
             _, sha = self.backend.get(path)
@@ -365,6 +381,7 @@ class StateStore:
 
     def delete_account(self, account_id: str, message: str | None = None) -> None:
         path = self.account_path(account_id)
+        self.ensure_ready()
         try:
             self.backend.delete(path, message or f"chore(state): delete account {account_id}")
         except Conflict as exc:
@@ -421,7 +438,9 @@ class StateStore:
 
     def put_raw(self, path: str, data: bytes, message: str) -> None:
         """写任意字节（如二维码 PNG）；只用于 `responses/` 下的短命文件。"""
-        self.backend.put(path, data, message, existing_sha=None, create_only=False)
+        self.ensure_ready()
+        _, sha = self.backend.get(path)
+        self.backend.put(path, data, message, sha=sha, create_only=False)
 
     @staticmethod
     def response_path(session_id: str) -> str:
