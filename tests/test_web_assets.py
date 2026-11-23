@@ -25,10 +25,21 @@ def test_index_loads_tweetnacl_before_the_module():
 
 def test_every_referenced_asset_exists():
     html = (WEB / "index.html").read_text(encoding="utf-8")
-    refs = re.findall(r'(?:src|href)="([^"#:]+)"', html)
+    refs = [ref.split("?", 1)[0] for ref in re.findall(r'(?:src|href)="([^"#:]+)"', html)]
     assert refs, "index.html 没有任何本地引用"
     missing = [ref for ref in refs if not (WEB / ref).exists() and not (ROOT / ref).exists()]
     assert missing == []
+
+
+def test_scripts_and_styles_are_versioned_for_caching():
+    """静态资源带 `?v=`：GitHub Pages 对 HTML/JS 有缓存，用户改完看不到新版只能手动硬刷。
+
+    回归来源：新加的"导入 cURL"区块上线后，用户打开页面还是旧版，以为代码没改。
+    """
+    html = (WEB / "index.html").read_text(encoding="utf-8")
+    for asset in ("style.css", "app.js"):
+        pattern = re.compile(rf'(?:src|href)="{re.escape(asset)}\?v=\d+"')
+        assert pattern.search(html), f"{asset} 需要带 ?v= 版本号"
 
 
 def test_crypto_js_fails_loud_when_nacl_is_absent():
