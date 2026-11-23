@@ -170,6 +170,8 @@
       <p id="status-message" role="status" aria-live="polite">未连接。填入仓库与 token 后点“连接并保存”。</p>
     </div>
 
+    <!-- tweetnacl 先加载：crypto.js 在模块初始化时读 globalThis.nacl -->
+    <script src="assets/vendor/nacl-fast.min.js"></script>
     <script type="module" src="app.js"></script>
   </body>
 </html>

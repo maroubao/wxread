@@ -2,6 +2,9 @@
 // 依赖 web/assets/vendor/nacl-fast.min.js（tweetnacl 1.0.3，本地 vendored，无 CDN）。
 
 const nacl = globalThis.nacl;
+if (!nacl || !nacl.box || !nacl.secretbox) {
+  throw new Error("tweetnacl 未加载：index.html 必须先用 <script src=\"assets/vendor/nacl-fast.min.js\"> 引入");
+}
 
 export const CONTEXT_TEMPLATE = (ownerRepo, keyVersion) => `wxread-state|${ownerRepo}|v${keyVersion}`;
 export const STATE_KEY_LEN = 32;
