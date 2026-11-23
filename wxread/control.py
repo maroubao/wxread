@@ -363,14 +363,15 @@ def handle_schedule(ctx: ControlContext, payload: Mapping[str, Any]) -> dict:
                 raise ControlError("daily 需形如 01:07")
             if not 0 <= int(hour) <= 23 or not 0 <= int(minute) <= 59:
                 raise ControlError("daily 超出时间范围")
-            schedule["daily"] = f"{int(hour):02d}:{int(minute):02d}"
+            if f"{int(hour):02d}:{int(minute):02d}" != DEFAULT_DAILY:
+                raise ControlError("每日时间由read.yml固定为01:07，修改时间需修改工作流cron")
         if "warm_hours" in payload:
             hours = int(payload["warm_hours"])
-            if hours not in (0, 1, 3, 6, 12):
-                raise ControlError("warm_hours 只允许 0/1/3/6/12")
+            if hours not in (0, DEFAULT_WARM_HOURS):
+                raise ControlError("保活由warm.yml固定为每6小时，可设置0关闭")
             schedule["warm_hours"] = hours
-        schedule.setdefault("daily", DEFAULT_DAILY)
-        schedule.setdefault("warm_hours", DEFAULT_WARM_HOURS)
+        schedule["daily"] = DEFAULT_DAILY
+        schedule["warm_hours"] = 0 if schedule.get("warm_hours") == 0 else DEFAULT_WARM_HOURS
         settings["schedule"] = schedule
         settings["updated_at"] = ctx.now_iso()
         return settings

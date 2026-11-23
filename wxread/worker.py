@@ -182,11 +182,13 @@ def cmd_migrate(store: StateStore, env: Mapping[str, str]) -> int:
     return EXIT_OK
 
 
-def schedule_gate(store: StateStore, mode: str) -> str:
+def schedule_gate(store: StateStore, mode: str, *, automatic: bool = True) -> str:
     """`settings.schedule` 的运行时开关：cron 写死在 workflow 里，只能在这里拦。
 
     返回空串表示放行，否则返回拦截原因（调用方打 notice 后正常退出）。
     """
+    if not automatic:
+        return ""
     try:
         settings = store.load_settings()
     except StateError as exc:  # 设置读失败不该让定时任务全挂
@@ -201,7 +203,7 @@ def schedule_gate(store: StateStore, mode: str) -> str:
 
 
 def cmd_read(store: StateStore, env: Mapping[str, str], transport_factory=None, sleep=None) -> int:
-    blocked = schedule_gate(store, "read")
+    blocked = schedule_gate(store, "read", automatic=env.get("GITHUB_EVENT_NAME") != "workflow_dispatch")
     if blocked:
         log.info("跳过本次阅读：%s", blocked)
         print(f"::notice::read skipped: {blocked}", flush=True)
@@ -260,7 +262,7 @@ def cmd_warm(store: StateStore, env: Mapping[str, str], transport_factory=None, 
     from . import warm as warm_mod
     from .reader import RequestsTransport
 
-    blocked = schedule_gate(store, "warm")
+    blocked = schedule_gate(store, "warm", automatic=env.get("GITHUB_EVENT_NAME") != "workflow_dispatch")
     if blocked:
         log.info("跳过本次保活：%s", blocked)
         print(f"::notice::warm skipped: {blocked}", flush=True)

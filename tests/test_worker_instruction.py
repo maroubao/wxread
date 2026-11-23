@@ -46,7 +46,7 @@ def seed_control_key(store: StateStore):
 
 def test_instruction_path_reads_json_from_env(store: StateStore):
     public, secret = seed_control_key(store)
-    env, session_id, reply_secret = make_instruction("schedule", {"daily": "02:30", "enabled": True}, public, secret)
+    env, session_id, reply_secret = make_instruction("schedule", {"daily": "01:07", "enabled": True}, public, secret)
 
     assert cmd_control(store, env) == 0
 
@@ -55,7 +55,7 @@ def test_instruction_path_reads_json_from_env(store: StateStore):
     receipt = crypto.unseal(json.loads(file[0].decode("utf-8")), reply_secret)
     assert receipt["ok"] is True
     assert receipt["action"] == "schedule"
-    assert store.load_settings()["schedule"]["daily"] == "02:30"
+    assert store.load_settings()["schedule"]["daily"] == "01:07"
 
 
 def test_instruction_path_reports_failure_with_exit_code(store: StateStore):
@@ -81,13 +81,13 @@ def test_queued_instruction_uses_github_run_creation_time(store, monkeypatch):
     from wxread import control
 
     public, secret = seed_control_key(store)
-    env, _session, _reply = make_instruction("schedule", {"daily": "02:30"}, public, secret)
+    env, _session, _reply = make_instruction("schedule", {"daily": "01:07"}, public, secret)
     received_at = int(time.time())
     env["GITHUB_RUN_ID"] = "123"
     monkeypatch.setattr(store.backend, "run_created_at", lambda _run: received_at, raising=False)
     monkeypatch.setattr(control.time, "time", lambda: received_at + 180)
     assert cmd_control(store, env) == 0
-    assert store.load_settings()["schedule"]["daily"] == "02:30"
+    assert store.load_settings()["schedule"]["daily"] == "01:07"
 
 
 def test_expired_instruction_writes_an_encrypted_failure_receipt(store):

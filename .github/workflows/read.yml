@@ -15,9 +15,9 @@ on:
         required: false
         default: "1200"
 
-# 阅读与保活互不抢占：同一时刻只跑一个 read
+# 阅读与保活共用互斥组，防止同账户轮换Cookie互相覆盖
 concurrency:
-  group: wxread-read
+  group: wxread-session
   cancel-in-progress: false
 
 permissions:

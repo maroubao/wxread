@@ -28,9 +28,9 @@ def test_schedule_edit_preserves_concurrent_notifications(store, monkeypatch):
         store, monkeypatch, "settings.enc.json",
         lambda: store.save_settings({"schedule": {"daily": "01:07"}, "notifications": {"enabled": True}}),
     )
-    control.handle_schedule(control.ControlContext(store), {"daily": "02:30"})
+    control.handle_schedule(control.ControlContext(store), {"enabled": False})
     saved = store.load_settings()
-    assert saved["schedule"]["daily"] == "02:30"
+    assert saved["schedule"]["enabled"] is False
     assert saved["notifications"]["enabled"] is True
 
 
