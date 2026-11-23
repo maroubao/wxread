@@ -64,3 +64,49 @@ def test_receipt_is_decrypted_with_reply_key(mod):
     receipt = {"ok": True, "accounts": ["abc123"]}
     env = crypto.seal(receipt, crypto.keypair_from_secret(secret)[0])
     assert crypto.unseal(env, secret)["accounts"] == ["abc123"]
+
+
+def test_curl_file_is_wrapped_into_payload(mod, monkeypatch, tmp_path):
+    """F12 复制出来的 cURL 是纯文本，不能当 JSON 喂给 --payload-file。"""
+    captured = {}
+    public, secret = crypto.new_keypair()
+    monkeypatch.setattr(mod, "load_public_key", lambda *a, **k: (public, 1))
+    monkeypatch.setattr(
+        mod, "dispatch", lambda session, repo, workflow, inputs, ref: captured.update(inputs=inputs)
+    )
+    curl = tmp_path / "curl.txt"
+    curl.write_text("curl 'https://weread.qq.com/web/book/read' -H 'Cookie: wr_vid=1; wr_skey=2'", encoding="utf-8")
+
+    code = mod.main(
+        [
+            "import",
+            "--repo",
+            "owner/repo",
+            "--token",
+            "t",
+            "--wait",
+            "0",
+            "--curl-file",
+            str(curl),
+            "--label",
+            "主号",
+            "--target-count",
+            "30",
+        ]
+    )
+
+    assert code == 0
+    instruction = crypto.unseal(json.loads(captured["inputs"]["instruction"]), secret)
+    assert instruction["payload"]["label"] == "主号"
+    assert instruction["payload"]["target_count"] == 30
+    assert "wr_skey=2" in instruction["payload"]["curl"]
+
+
+def test_empty_curl_file_is_rejected(mod, monkeypatch, tmp_path):
+    public, _ = crypto.new_keypair()
+    monkeypatch.setattr(mod, "load_public_key", lambda *a, **k: (public, 1))
+    empty = tmp_path / "curl.txt"
+    empty.write_text("   \n", encoding="utf-8")
+
+    with pytest.raises(SystemExit, match="空"):
+        mod.main(["import", "--repo", "owner/repo", "--token", "t", "--wait", "0", "--curl-file", str(empty)])

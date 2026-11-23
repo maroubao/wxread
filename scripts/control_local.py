@@ -101,6 +101,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--ref", default="main", help="workflow 所在分支")
     parser.add_argument("--payload-json", default="", help="指令 payload，JSON 字符串")
     parser.add_argument("--payload-file", default="", help="从文件读 payload JSON")
+    parser.add_argument("--curl-file", default="", help="从文件读 cURL 原文（import 用，自动包成 payload）")
+    parser.add_argument("--label", default="", help="账户标签（配合 --curl-file）")
+    parser.add_argument("--target-count", type=int, default=0, help="目标阅读次数（配合 --curl-file，默认 40）")
     parser.add_argument("--wait", type=int, default=180, help="等待回执秒数，0=不等")
     args = parser.parse_args(argv)
 
@@ -109,7 +112,16 @@ def main(argv: list[str] | None = None) -> int:
     if not args.token:
         raise SystemExit("缺 --token（或设 GITHUB_TOKEN，需 contents + actions 写权限）")
 
-    if args.payload_file:
+    if args.curl_file:
+        curl_text = Path(args.curl_file).read_text(encoding="utf-8").strip()
+        if not curl_text:
+            raise SystemExit(f"{args.curl_file} 是空的")
+        payload = {"curl": curl_text}
+        if args.label:
+            payload["label"] = args.label
+        if args.target_count:
+            payload["target_count"] = args.target_count
+    elif args.payload_file:
         payload = json.loads(Path(args.payload_file).read_text(encoding="utf-8"))
     elif args.payload_json:
         payload = json.loads(args.payload_json)
