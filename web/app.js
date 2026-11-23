@@ -15,7 +15,15 @@ const state = {
   runs: [],
   sessions: new Map(), // session_id -> 回执私钥
   pollTimer: null,
+  qrShots: 0,
 };
+
+// 二维码轮询预算：control.yml 冷启动要装依赖、装浏览器，1–2 分钟才出第一张码；
+// 码本身 ~85 秒换一张，所以按时间预算（而不是次数）轮询，够撑到扫完。
+const QR_POLL_MS = 4000;
+const QR_BUDGET_MS = 15 * 60 * 1000;
+const RECEIPT_POLL_MS = 3000;
+const RECEIPT_TRIES = 100; // 5 分钟：够 control.yml 启动 + 二维码登录窗口
 
 // ---------------------------------------------------------------- 小工具
 
@@ -279,11 +287,11 @@ async function sendInstruction(action, payload, { quiet = false } = {}) {
 async function pollReceipt(sessionId, action, tries = 0) {
   const file = await gh.getFile(state.cfg, `responses/${sessionId}.json`);
   if (!file) {
-    if (tries >= 40) {
+    if (tries >= RECEIPT_TRIES) {
       say(`${action} 还没有回执：去 Actions 里看 control 运行日志。`, "warn");
       return;
     }
-    setTimeout(() => pollReceipt(sessionId, action, tries + 1).catch(() => {}), 3000);
+    setTimeout(() => pollReceipt(sessionId, action, tries + 1).catch(() => {}), RECEIPT_POLL_MS);
     return;
   }
   try {
@@ -309,21 +317,37 @@ async function findLatestQr() {
   return pngs.length ? `responses/${pngs[pngs.length - 1]}` : null;
 }
 
-async function pollQr(tries = 0) {
-  const path = await findLatestQr();
-  if (path) {
+async function pollQr(startedAt = Date.now(), shownPath = null) {
+  const elapsed = Math.round((Date.now() - startedAt) / 1000);
+  if (Date.now() - startedAt > QR_BUDGET_MS) {
+    say("二维码轮询超时：去 Actions 看 control 运行，或改用本机 scripts/qr_local.py。", "warn");
+    return;
+  }
+  let path = null;
+  try {
+    path = await findLatestQr();
+  } catch (error) {
+    // 网络抖动不算失败，下一轮再看
+  }
+  if (path && path !== shownPath) {
     const file = await gh.getFile(state.cfg, path);
     if (file) {
-      const blob = new Blob([file.bytes], { type: "image/png" });
-      const url = URL.createObjectURL(blob);
+      const url = URL.createObjectURL(new Blob([file.bytes], { type: "image/png" }));
       $("qr-slot").innerHTML = `<img alt="微信读书登录二维码，用微信扫描" src="${url}" />`;
-      return;
+      shownPath = path;
+      state.qrShots += 1;
+      say(`二维码已就绪（第 ${state.qrShots} 张，等了 ${elapsed} 秒），用微信扫一扫；过期会自动换新码。`, "ok");
     }
+  } else if (!shownPath) {
+    $("qr-slot").innerHTML =
+      `<div class="empty">control.yml 启动中…（已等 ${elapsed} 秒）` +
+      `<br />首次要装浏览器依赖，通常 1–2 分钟；码一出来就显示在这里。</div>`;
   }
-  if (tries < 30) setTimeout(() => pollQr(tries + 1).catch(() => {}), 3000);
+  setTimeout(() => pollQr(startedAt, shownPath).catch(() => {}), QR_POLL_MS);
 }
 
 async function askQr() {
+  state.qrShots = 0;
   $("qr-slot").innerHTML = '<div class="empty">已申请，等待 control.yml 生成二维码…</div>';
   await sendInstruction("qr", { label: $("inp-qr-label").value.trim(), timeout: 600 });
   pollQr().catch(() => {});

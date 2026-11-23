@@ -40,7 +40,7 @@ jobs:
   control:
     name: control
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
         with:
@@ -56,11 +56,20 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      # 只装 playwright 的 Python 包：runner 自带 Google Chrome，用它（channel="chrome"）
+      # 比 `playwright install --with-deps chromium`（apt + 下载 >150MB，实测 6 分钟）快两个数量级。
+      # 万一哪天镜像不带 Chrome，才回落到下载（会慢，但能跑）。
       - name: 安装浏览器（qr 指令才需要）
         if: ${{ github.event.inputs.control == 'instruction' }}
         run: |
           pip install "playwright>=1.45,<2"
-          python -m playwright install --with-deps chromium
+          if [ -x /opt/google/chrome/chrome ] || command -v google-chrome >/dev/null 2>&1; then
+            google-chrome --version || /opt/google/chrome/chrome --version || true
+            echo "使用 runner 预装的 Chrome，跳过浏览器下载"
+          else
+            echo "未找到系统 Chrome，下载 Playwright chromium（慢路径）"
+            python -m playwright install --with-deps chromium
+          fi
 
       - name: 执行
         env:
