@@ -1,0 +1,49 @@
+name: pages
+
+# 控制台是纯静态零构建页面：直接发布仓库根目录，web/index.html 即 /web/。
+on:
+  push:
+    branches: [main]
+    paths:
+      - "web/**"
+      - "docs/design/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    name: deploy
+    runs-on: ubuntu-24.04
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 确认静态资源齐全
+        run: |
+          test -f web/index.html
+          test -f web/app.js
+          test -f web/crypto.js
+          test -f web/gh.js
+          test -f web/style.css
+          test -f web/assets/vendor/nacl-fast.min.js
+          test -f docs/design/tokens.css
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: .
+
+      - id: deployment
+        uses: actions/deploy-pages@v4

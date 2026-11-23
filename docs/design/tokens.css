@@ -1,0 +1,92 @@
+/* ============================================================
+   wxread 控制台 · 设计令牌（唯一定义处）
+   定稿：A 钢蓝 #2563EB · 2026-11-23
+   规则：页面/组件内不得出现任何硬编码色值、字号、圆角、间距。
+   ============================================================ */
+
+:root {
+  /* ---- 中性色 ---- */
+  --bg: #f7f8fa;
+  --surface: #ffffff;
+  --surface-2: #f2f4f7;
+  --border: #e4e7ec;
+  --border-strong: #d0d5dd;
+  --text: #101828;
+  --text-2: #475467;
+  --text-3: #667085;
+
+  /* ---- 主色：A 钢蓝 ---- */
+  --accent: #2563eb;
+  --accent-hover: #1d4ed8;
+  --accent-weak: #eaf0fe;
+  --accent-text: #1d4ed8;
+
+  /* ---- 图表 ---- */
+  --chart-1: #2563eb;
+  --chart-2: #a8c3fa;
+  --chart-grid: #eef1f5;
+  --chart-empty: #edf0f4;
+
+  /* ---- 语义色 ---- */
+  --ok-text: #067647;
+  --ok-bg: #ecfdf3;
+  --warn-text: #b54708;
+  --warn-bg: #fffaf3;
+  --warn-border: #fedf89;
+  --danger-text: #b42318;
+  --danger-bg: #fef3f2;
+  --danger-solid: #d92d20;
+
+  /* ---- 字体 ---- */
+  --font: "Inter", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  --mono: "SF Mono", "JetBrains Mono", ui-monospace, monospace;
+
+  --fs-display: 28px;
+  --fs-metric: 30px;
+  --fs-h2: 15px;
+  --fs-body: 13px;
+  --fs-sm: 12px;
+  --fs-xs: 11px;
+
+  /* ---- 间距（唯一刻度） ---- */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 24px;
+  --sp-6: 32px;
+  --sp-7: 40px;
+  --sp-8: 56px;
+
+  /* ---- 圆角 ---- */
+  --r-sm: 6px;
+  --r-md: 10px;
+  --r-lg: 14px;
+  --r-full: 999px;
+
+  /* ---- 阴影 ---- */
+  --shadow-1: 0 1px 2px rgba(16, 24, 40, 0.04);
+  --shadow-2: 0 8px 24px rgba(16, 24, 40, 0.1);
+
+  /* ---- 版式 ---- */
+  --content-max: 1180px;
+  --rail-w: 320px;
+  --dur: 160ms;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root { --dur: 0ms; }
+}
+
+/* 数字等宽：所有数值类文本必须带 .num 或使用该属性 */
+.num {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum" 1;
+}
+
+/* 焦点可见（禁止 outline:none） */
+:where(button, a, input, select, textarea):focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: var(--r-sm);
+}

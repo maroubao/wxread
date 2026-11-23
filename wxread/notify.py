@@ -1,0 +1,177 @@
+"""通知：邮件 / PushPlus / 飞书 / Telegram。
+
+规则（`docs/THREAT-MODEL.md` T-09）：正文只允许账户 label、状态、读书数、原因码；
+所有文本出站前过 `logsafe.scrub()`，任何渠道都**不接受** cookie/token 字样。
+
+渠道统一接口 `send(channel_cfg, title, text) -> str`：成功返回空串，失败抛 `NotifyError`。
+"""
+
+from __future__ import annotations
+
+import json
+import smtplib
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass
+from email.header import Header
+from email.mime.text import MIMEText
+from email.utils import formataddr
+from typing import Mapping
+
+from .logsafe import scrub
+
+CHANNELS = ("email", "pushplus", "feishu", "telegram")
+HTTP_TIMEOUT = 15
+DEFAULT_SUBJECT_PREFIX = "[wxread]"
+
+
+class NotifyError(RuntimeError):
+    """渠道发送失败（网络、鉴权、配置缺失）。"""
+
+
+@dataclass
+class NotifyResult:
+    channel: str
+    ok: bool
+    detail: str = ""
+
+    def as_dict(self) -> dict:
+        return {"channel": self.channel, "ok": self.ok, "detail": scrub(self.detail)}
+
+
+def render_run_report(records: list[Mapping]) -> tuple[str, str]:
+    """把一批 run 记录拼成简报：一行一账户，绝不带 cookie。"""
+    total = len(records)
+    ok = sum(1 for r in records if r.get("level") == "L0")
+    read = sum(int(r.get("read_count") or 0) for r in records)
+    title = f"{DEFAULT_SUBJECT_PREFIX} 阅读完成 {ok}/{total} 账户，+{read} 次"
+    lines = []
+    for record in records:
+        label = record.get("label") or record.get("account_id") or "?"
+        level = record.get("level") or "-"
+        count = int(record.get("read_count") or 0)
+        reason = record.get("reason") or ""
+        tail = f"（{reason}）" if reason and level != "L0" else ""
+        lines.append(f"{label}：{level} +{count}{tail}")
+    return title, "\n".join(lines)
+
+
+def render_failure(account_label: str, reason: str, hint: str = "") -> tuple[str, str]:
+    title = f"{DEFAULT_SUBJECT_PREFIX} 需要重新扫码：{account_label}"
+    text = f"账户：{account_label}\n原因：{reason}"
+    if hint:
+        text += f"\n建议：{hint}"
+    text = scrub(text)
+    return title, text
+
+
+def render_test(channel: str) -> tuple[str, str]:
+    return f"{DEFAULT_SUBJECT_PREFIX} 测试通知（{channel}）", f"这是一条来自 wxread 的测试消息：{channel} 通道可用。"
+
+
+def _post(url: str, body: bytes, headers: Mapping[str, str]) -> str:
+    request = urllib.request.Request(url, data=body, headers=dict(headers), method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT) as response:
+            return response.read(8192).decode("utf-8", "replace")
+    except Exception as exc:  # 网络/证书/超时统一收口
+        raise NotifyError(f"{type(exc).__name__}: {exc}") from exc
+
+
+def send_email(cfg: Mapping, title: str, text: str) -> str:
+    host = (cfg.get("host") or "").strip()
+    user = (cfg.get("user") or "").strip()
+    password = cfg.get("password") or ""
+    to = cfg.get("to") or user
+    if not host or not user or not password:
+        raise NotifyError("邮件配置缺少 host/user/password")
+    port = int(cfg.get("port") or 465)
+    message = MIMEText(scrub(text), "plain", "utf-8")
+    message["Subject"] = Header(scrub(title), "utf-8")
+    message["From"] = formataddr(("wxread", user))
+    message["To"] = to
+    try:
+        if port == 587:
+            server = smtplib.SMTP(host, port, timeout=HTTP_TIMEOUT)
+            server.starttls()
+        else:
+            server = smtplib.SMTP_SSL(host, port, timeout=HTTP_TIMEOUT)
+        with server:
+            server.login(user, password)
+            server.sendmail(user, [item.strip() for item in to.split(",") if item.strip()], message.as_string())
+    except Exception as exc:
+        raise NotifyError(f"{type(exc).__name__}: {exc}") from exc
+    return ""
+
+
+def send_pushplus(cfg: Mapping, title: str, text: str) -> str:
+    token = (cfg.get("token") or "").strip()
+    if not token:
+        raise NotifyError("PushPlus 缺少 token")
+    body = json.dumps(
+        {"token": token, "title": scrub(title), "content": scrub(text), "template": "txt"},
+        ensure_ascii=False,
+    ).encode("utf-8")
+    raw = _post("https://www.pushplus.plus/send", body, {"Content-Type": "application/json"})
+    return "" if '"code":200' in raw.replace(" ", "") else raw[:200]
+
+
+def send_feishu(cfg: Mapping, title: str, text: str) -> str:
+    webhook = (cfg.get("webhook") or "").strip()
+    if not webhook:
+        raise NotifyError("飞书缺少 webhook")
+    body = json.dumps(
+        {"msg_type": "text", "content": {"text": f"{scrub(title)}\n{scrub(text)}"}},
+        ensure_ascii=False,
+    ).encode("utf-8")
+    raw = _post(webhook, body, {"Content-Type": "application/json"})
+    return "" if '"code":0' in raw.replace(" ", "") else raw[:200]
+
+
+def send_telegram(cfg: Mapping, title: str, text: str) -> str:
+    token = (cfg.get("bot_token") or "").strip()
+    chat_id = str(cfg.get("chat_id") or "").strip()
+    if not token or not chat_id:
+        raise NotifyError("Telegram 缺少 bot_token/chat_id")
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    body = urllib.parse.urlencode(
+        {"chat_id": chat_id, "text": f"{scrub(title)}\n{scrub(text)}", "disable_web_page_preview": "true"}
+    ).encode("utf-8")
+    raw = _post(url, body, {"Content-Type": "application/x-www-form-urlencoded"})
+    return "" if '"ok":true' in raw.replace(" ", "") else raw[:200]
+
+
+_SENDERS = {
+    "email": send_email,
+    "pushplus": send_pushplus,
+    "feishu": send_feishu,
+    "telegram": send_telegram,
+}
+
+
+def send(channel: str, cfg: Mapping, title: str, text: str) -> NotifyResult:
+    sender = _SENDERS.get(channel)
+    if sender is None:
+        return NotifyResult(channel, False, f"未知渠道 {channel}")
+    try:
+        leftover = sender(cfg, title, text)
+    except NotifyError as exc:
+        return NotifyResult(channel, False, str(exc))
+    if leftover:
+        return NotifyResult(channel, False, f"接口返回异常：{leftover}")
+    return NotifyResult(channel, True)
+
+
+def dispatch(settings: Mapping, title: str, text: str, channels: list[str] | None = None) -> list[NotifyResult]:
+    """按 settings.notifications 发一遍；未启用则返回空列表（不是错误）。"""
+    block = dict(settings.get("notifications") or {})
+    if not block.get("enabled"):
+        return []
+    wanted = channels or list(block.get("channels") or [])
+    results: list[NotifyResult] = []
+    for channel in wanted:
+        if channel not in CHANNELS:
+            results.append(NotifyResult(channel, False, "未支持的渠道"))
+            continue
+        results.append(send(channel, dict(block.get(channel) or {}), title, text))
+    return results

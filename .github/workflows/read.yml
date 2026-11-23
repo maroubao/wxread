@@ -1,0 +1,52 @@
+name: read
+
+# 每天北京 01:07 读一轮（UTC 17:07）；手动触发用于临时补读。
+on:
+  schedule:
+    - cron: "7 17 * * *"
+  workflow_dispatch:
+    inputs:
+      pace:
+        description: "两次阅读间隔秒数（默认 30）"
+        required: false
+        default: "30"
+      deadline:
+        description: "单账户最长秒数（默认 1200）"
+        required: false
+        default: "1200"
+
+# 阅读与保活互不抢占：同一时刻只跑一个 read
+concurrency:
+  group: wxread-read
+  cancel-in-progress: false
+
+permissions:
+  contents: write # 进度、cookie、运行记录都写状态分支
+
+jobs:
+  read:
+    name: read
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 读取
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WXREAD_STATE_KEY: ${{ secrets.WXREAD_STATE_KEY }}
+          WXREAD_PACE: ${{ github.event.inputs.pace }}
+          WXREAD_DEADLINE: ${{ github.event.inputs.deadline }}
+        run: python -m wxread.worker read

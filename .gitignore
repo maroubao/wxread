@@ -1,7 +1,22 @@
 # Python cache files
 __pycache__/
 *.pyc
+.pytest_cache/
 
 # Log files
 logs/
 *.log
+
+# 本机扫码/调试产物：绝不入库（cookie 是凭据，二维码 2 分钟就废）
+.qr-cookies.json
+qr-latest.png
+qr-scan.png
+qr-big.png
+qr-out/
+probe-*.png
+probe-*.py.tmp
+
+# 依赖与虚拟环境
+.venv/
+venv/
+node_modules/

@@ -1,0 +1,81 @@
+name: control
+
+# 所有管理动作都走这一个入口：从网页端（gh 变量/网页 form 或 web/ 页面）提交密文指令。
+# 明文口令与 cookie 只在浏览器里加密，仓库/日志里只有密文。
+on:
+  workflow_dispatch:
+    inputs:
+      control:
+        description: "init = 生成指令密钥对；instruction = 执行密文指令"
+        type: choice
+        options: [instruction, init]
+        default: instruction
+      instruction:
+        description: "密文指令（JSON 信封；instruction 模式必填）"
+        required: false
+        type: string
+      session_id:
+        description: "会话 id（并发分组 + 回执文件名，防止重复执行）"
+        required: false
+        type: string
+      qr_seconds:
+        description: "扫码等待秒数（qr 指令）"
+        required: false
+        default: "600"
+        type: string
+
+# 同一 session 只跑一个；不同 session 互不阻塞
+concurrency:
+  group: wxread-control-${{ github.event.inputs.session_id || github.run_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write # 状态分支由 Contents API 写入，需要写权限
+
+jobs:
+  control:
+    name: control
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 安装浏览器（qr 指令才需要）
+        if: ${{ github.event.inputs.control == 'instruction' }}
+        run: |
+          pip install "playwright>=1.45,<2"
+          python -m playwright install --with-deps chromium
+
+      - name: 执行
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WXREAD_STATE_KEY: ${{ secrets.WXREAD_STATE_KEY }}
+          WXREAD_CONTROL: ${{ github.event.inputs.control }}
+          WXREAD_INSTRUCTION: ${{ github.event.inputs.instruction }}
+          WXREAD_CONTROL_SK: ${{ secrets.WXREAD_CONTROL_SK }}
+          WXREAD_SESSION: ${{ github.event.inputs.session_id }}
+          WXREAD_QR_SECONDS: ${{ github.event.inputs.qr_seconds }}
+          WXREAD_QR_DIR: qr-out
+        run: python -m wxread.worker control
+
+      # 私有仓库里 blob 链接不好点，二维码同时作为 artifact 兜底
+      - name: 上传二维码
+        if: ${{ always() && hashFiles('qr-out/*.png') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: qr
+          path: qr-out/*.png
+          if-no-files-found: ignore
+          retention-days: 1

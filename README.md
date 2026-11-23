@@ -1,122 +1,69 @@
-# 更新第三版，提高读书稳定程度，最大限量保持cookie有效时间，欢迎fork！
+# wxread · 微信读书自动阅读（多账户 · 加密状态 · 零服务器）
 
-## 项目介绍 📚
+每天北京时间 **01:07** 自动读一轮，每 6 小时保活一次会话。所有 cookie 与口令以密文存放在独立的
+`wxread-state` 分支，仓库里没有明文凭据。控制台是纯静态页面，不需要服务器、不需要构建。
 
-这个脚本主要是为了在微信读书的阅读**挑战赛中刷时长**和**保持天数**。由于本人偶尔看书时未能及时签到，导致入场费打了水漂。网上找了一些，发现高赞的自动阅读需要挂阅读器模拟或者用ADB模拟，实现一点也不优雅。因此，我决定编写一个自动化脚本。通过对官网接口的抓包和JS逆向分析实现。
-
-该脚本具备以下功能：
-
-- **阅读时长调节**：默认计入排行榜和挑战赛，时长可调节，默认为60分钟。
-- **定时运行推送**：可部署在GitHub Action/服务器上，支持每天定时运行并推送结果到微信/飞书等渠道。
-- **Cookie自动更新**：脚本能自动获取并更新Cookie，一次部署后面无需其它操作。
-- **轻量化设计**：本脚本实现了轻量化的编写，部署服务器/GIthub action后到点运行，无需额外硬件。
-
-***
-## 操作步骤 🛠️
-
-### 抓包准备
-
-脚本逻辑还是比较简单的，`main.py`与`push.py`代码不需要改动。在微信阅读官网 [微信读书](https://weread.qq.com/) 搜索【三体】点开阅读点击下一页进行抓包，抓到`read`接口 `https://weread.qq.com/web/book/read`，如果返回格式正常（如：
-
-```json
-{
-  "succ": 1,
-  "synckey": 564589834
-}
 ```
-右键复制为Bash格式。脚本会自动从这段 `curl bash` 中提取 `headers`、`cookies` 和请求体里的关键字段，通常不需要再手工改 `config.py` 里的 `data`。
-
-### 方法一： GitHub Action部署运行（GitHub运行）
-
-
-- Fork这个仓库，在仓库 **Settings** -> 左侧列表中的 **Secrets and variables** -> **Actions**，然后在右侧的 **Repository secrets** 中添加如下值：
-  - `WXREAD_CURL_BASH`：上面抓read接口后转换为curl_bash的数据。
-  - `PUSH_METHOD`：推送方法，支持 `pushplus`、`wxpusher`、`telegram`、`serverchan`、`feishu`，也支持多渠道并行，例如 `feishu,pushplus`。
-  - `PUSHPLUS_TOKEN` or `WXPUSHER_SPT` or `TELEGRAM_BOT_TOKEN`&`TELEGRAM_CHAT_ID` or `SERVERCHAN_SPT` or `FEISHU_WEBHOOK`: 选择推送后填写对应配置。
-  
-- 在 **Variables** 部分，最下方添加变量：
-  - `READ_NUM`：设定每次阅读的目标次数。
-
-
-- 基本释义：
-
-| key                        | Value                               | 说明                                                         | 属性      |
-| ------------------------- | ---------------------------------- | ------------------------------------------------------------ | --------- |
-| `WXREAD_CURL_BASH`         | `read` 接口 `curl_bash`数据 | **必填**，必须提供有效指令                                   | secrets   |
-| `READ_NUM`                 | 阅读次数（每次 30 秒）              | **可选**，阅读时长，默认 20 分钟                           | variables |
-| `PUSH_METHOD`              | `pushplus`/`wxpusher`/`telegram`/`serverchan`/`feishu` 或逗号组合    | **可选**，推送方式，支持单个或多个渠道，默认不推送                                       |    secrets     |
-| `PUSHPLUS_TOKEN`           | PushPlus 的 token                   | 当 `PUSH_METHOD=pushplus` 时必填，[获取地址](https://www.pushplus.plus/uc.html) | secrets   |
-| `WXPUSHER_SPT`             | WxPusher 的token                    | 当 `PUSH_METHOD=wxpusher` 时必填，[获取地址](https://wxpusher.zjiecode.com/docs/#/?id=获取spt) | secrets   |
-| `TELEGRAM_BOT_TOKEN`  <br>`TELEGRAM_CHAT_ID`   <br>`http_proxy`/`https_proxy`（可选）| 群组id以及机器人token                 | 当 `PUSH_METHOD=telegram` 时必填，[配置文档](https://www.nodeseek.com/post-22475-1) | secrets   |
-| `SERVERCHAN_SPT`          | serverchan 的 SendKey               | 当 `PUSH_METHOD=serverchan` 时必填，[获取地址](https://sct.ftqq.com/sendkey) | secrets   |
-| `FEISHU_WEBHOOK`          | 飞书机器人的 Webhook 地址               | 当 `PUSH_METHOD` 包含 `feishu` 时必填，在飞书群机器人设置中获取 | secrets   |
-
-**重要：除了READ_NUM配置在varables，其它的都配置在secrets里面的；需要推送`PUSH_METHOD`是必填的。**
-
-### 视频教程
-
-[![视频教程](https://github.com/user-attachments/assets/ec144869-3dbb-40fe-9bc5-f8bf1b5fce3c)](https://www.bilibili.com/video/BV1kJ6gY3En3/ "点击查看视频")
-
-
-### 方法二： 服务器运行（docker部署）
-
-- 在你的服务器上有Python运行环境即可，使用`cron`定义自动运行。
-- 或者通过docker运行，将抓到的bash命令在 [Convert](https://curlconverter.com/python/) 转化为Python字典格式，复制需要的headers与cookies即可（data不需要）。
-
-steps1：克隆这个项目：`git clone https://github.com/findmover/wxread.git`<br>
-steps2：配置config.py里的headers、cookies、READ_NUM、PUSH_METHOD以及对应推送方式token<br>
-steps3：进入目录使用镜像构建容器：
-`docker rm -f wxread && docker build -t wxread . && docker run -d --name wxread -v $(pwd)/logs:/app/logs --restart always wxread`<br>
-steps4：测试：`docker exec -it wxread python /app/main.py`
-
-***
-## Attention 📢
-
-1. **签到次数调整**：只需签到完成挑战赛可以将`num`次数从120调整为2，每次`num`为30秒，200即100分钟。
-   
-2. **解决阅读时间问题**：对于issue中提出的“阅读时间没有增加”，“增加时间与刷的时间不对等”建议保留`config.py`中的【data】字段，默认阅读三体，其它书籍自行测试。
-
-3. **GitHub Action部署/本地部署**：主要配置config.py即可，Action部署使用环境变量，本地部署修改config.py里的阅读次数、headers、cookies即可。
-
-4. **推送**：pushplus推送偶尔出问题，猜测是GitHub action环境问题，增加重试机制。并增加wxpusher的极简推送方式，同时支持飞书机器人推送和多渠道并行通知。
-5. **read 接口失效处理**：当前版本会优先使用 `WXREAD_CURL_BASH` 中最新抓包的请求体字段，减少因为 `data/appId/ps/pc/ci/co/sm/pr` 过期导致的失效问题。
-
-### 飞书机器人配置示例
-
-如果你希望每次任务完成后通过飞书提醒：
-
-1. 在飞书群中添加**自定义机器人**。
-2. 复制机器人的 `Webhook` 地址。
-3. 在 GitHub Actions 的 `Secrets` 中新增：
-   - `PUSH_METHOD=feishu`
-   - `FEISHU_WEBHOOK=https://open.feishu.cn/open-apis/bot/v2/hook/xxxx`
-
-如果你希望同时发到多个渠道，例如飞书 + PushPlus：
-
-```text
-PUSH_METHOD=feishu,pushplus
+read.yml   每天 01:07  ─┐
+warm.yml   每 6 小时   ─┼─> worker ──> wxread-state 分支（密文）
+control.yml  手动/页面 ─┘                 accounts/ settings/ runs/ responses/
 ```
 
+## 特性
 
-***
-## 字段解释 🔍
+- **多账户**：每个微信读书账号一份 `accounts/<sha256(uid)[:12]>.enc.json`，互不影响；一个号过期只跳它自己。
+- **加密状态**：`crypto_secretbox`（XSalsa20-Poly1305）+ 明文上下文前缀 `wxread-state|<owner>/<repo>|v<kv>`，跨仓库/跨版本搬运直接解密失败。
+- **密文指令**：浏览器里用公钥封指令（`nacl.box`，临时密钥 + 显式 nonce），worker 解封后执行；回执用一次性 `reply_key` 加密回传。
+- **四级失败处理**：L1 退避重试（5/15/45s）→ L2 强制 renewal 补救 → L3 置 `needs_login` + 通知；不会静默失败。
+- **扫码登录**：不用手抄 cookie。控制台点"生成二维码"，Actions 里用 Playwright 打开微信读书登录浮层，二维码写入状态分支后页面轮询显示（每 85 秒自动换码）。
+- **通知四选**：邮件（SMTP）、PushPlus、飞书 webhook、Telegram；口令写在加密的 `settings.enc.json` 里。
+- **零构建前端**：`web/` 只有 HTML + CSS + ES module，vendored tweetnacl，离线可用，Lighthouse a11y ≥ 90。
 
-| 字段 | 示例值 | 解释 |
-| --- | --- | --- |
-| `appId` | `"wbxxxxxxxxxxxxxxxxxxxxxxxx"` | 应用的唯一标识符。 |
-| `b` | `"ce032b305a9bc1ce0b0dd2a"` | 书籍或章节的唯一标识符。 |
-| `c` | `"0723244023c072b030ba601"` | 内容的唯一标识符，可能是页面或具体段落。 |
-| `ci` | `60` | 章节或部分的索引。 |
-| `co` | `336` | 内容的具体位置或页码。 |
-| `sm` | `"[插图]威慑纪元61年，执剑人在一棵巨树"` | 当前阅读的内容描述或摘要。 |
-| `pr` | `65` | 页码或段落索引。 |
-| `rt` | `88` | 阅读时长或阅读进度。 |
-| `ts` | `1727580815581` | 时间戳，表示请求发送的具体时间（毫秒级）。 |
-| `rn` | `114` | 随机数或请求编号，用于标识唯一的请求。 |
-| `sg` | `"bfdf7de2fe1673546ca079e2f02b79b937901ef789ed5ae16e7b43fb9e22e724"` | 安全签名，用于验证请求的合法性和完整性。 |
-| `ct` | `1727580815` | 时间戳，表示请求发送的具体时间（秒级）。 |
-| `ps` | `"xxxxxxxxxxxxxxxxxxxxxxxx"` | 用户标识符或会话标识符，用于追踪用户或会话。 |
-| `pc` | `"xxxxxxxxxxxxxxxxxxxxxxxx"` | 设备标识符或客户端标识符，用于标识用户的设备或客户端。 |
-| `s` | `"fadcb9de"` | 校验和或哈希值，用于验证请求数据的完整性。 |
+## 快速开始
 
+1. 建状态密钥并写进 Secret `WXREAD_STATE_KEY`：
 
+   ```bash
+   python -c "import os,base64;print(base64.b64encode(os.urandom(32)).decode())"
+   ```
+
+2. 跑一次 `control.yml`，`control = init`；把打印的 `private_key` 存进 Secret `WXREAD_CONTROL_SK`。
+3. Settings → Pages → Source 选 **GitHub Actions**；打开部署好的页面，填仓库 / token / 状态密钥 → 连接。
+4. 点"生成二维码"→ 微信扫码；再导入一次 curl 补全 `appId/ps/pc`（扫码只给 cookie）。
+5. 点"立即运行"验证一次，之后交给定时任务。
+
+完整步骤、Secrets 清单、故障处置与上线验收清单见 **[docs/RUNBOOK.md](docs/RUNBOOK.md)**。
+
+## 目录
+
+| 路径 | 内容 |
+| --- | --- |
+| `wxread/` | 运行时：`crypto` `state` `accounts` `reader` `jobs` `worker` `qr` `control` `notify` `warm` `logsafe` |
+| `web/` | 控制台（零构建）：`index.html` `app.js` `crypto.js` `gh.js` `style.css` |
+| `docs/` | `ARCHITECTURE.md` `THREAT-MODEL.md` `DESIGN.md` `RUNBOOK.md` `REVIEW.md` `design/` `reviews/` |
+| `tests/` | pytest（102 个）+ `tests/js/` 跨语言加密互通测试（4 个） |
+| `.github/workflows/` | `read.yml` `warm.yml` `control.yml` `tests.yml` `pages.yml` |
+
+## 本地开发
+
+```bash
+pip install -r requirements.txt pytest
+python -m pytest tests -q                 # 102 passed
+node --test tests/js/crypto.test.mjs      # 4 passed
+python scripts/scan_secrets.py            # 明文密钥扫描（CI 同款）
+python scripts/qr_local.py --wait 300     # 本机真扫码，写 .qr-cookies.json（已 gitignore）
+```
+
+## 与旧版（v3）的差异
+
+| 旧 | 新 |
+| --- | --- |
+| `main.py` 单文件 + `config.py` 硬编码 | `wxread/` 包，依赖方向 `worker → jobs → reader → state → crypto` |
+| cookie 明文在 Secret 里，`wr_skey[:8]` 截断 | cookie 只在密文状态里，完整 `wr_skey` |
+| 通知走 `push.py`（含 WxPusher / ServerChan） | 只留邮件 / PushPlus / 飞书 / Telegram |
+| 每天 01:00 一次，失败了只发消息 | 01:07 + 每 6 小时保活；L1→L2→L3 分级处置 |
+| Docker / 本地 crontab 也能跑 | 只支持 GitHub Actions（Dockerfile 已删除） |
+
+## 免责
+
+本项目只操作自己的账号，用于在阅读挑战赛中保持天数。接口是微信读书网页端的公开接口，行为等同于浏览器里手动翻页。请自行评估账号风险。

@@ -1,0 +1,71 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: wxread-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    name: pytest
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pytest
+
+      - name: pytest
+        run: python -m pytest tests -q
+
+      - name: 语法检查（compileall）
+        run: python -m compileall -q wxread scripts tests
+
+      - name: 明文密钥扫描
+        run: python scripts/scan_secrets.py
+
+  node:
+    name: node
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 前端加密互通
+        env:
+          PYTHON: python
+        run: node --test tests/js/crypto.test.mjs
+
+      - name: 前端语法检查
+        run: |
+          node --check web/app.js
+          node --check web/crypto.js
+          node --check web/gh.js

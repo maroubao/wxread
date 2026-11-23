@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>微信读书自动阅读 · 控制台</title>
+    <link rel="stylesheet" href="../docs/design/tokens.css" />
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <div class="wrap">
+      <header class="bar">
+        <div class="brand"><span class="mark" aria-hidden="true">读</span>微信读书自动阅读</div>
+        <span class="chip" id="conn-chip"><span class="dot" id="conn-dot"></span><span id="conn-text">未连接</span></span>
+        <div class="spacer"></div>
+        <button type="button" id="btn-refresh">刷新</button>
+        <button type="button" class="primary" id="btn-run">立即运行</button>
+        <button type="button" id="btn-stop">停止</button>
+      </header>
+
+      <section aria-labelledby="cfg-title">
+        <h2 id="cfg-title">连接与密钥</h2>
+        <div class="card">
+          <div class="cols">
+            <label class="field">
+              <span>仓库（owner/repo）</span>
+              <input type="text" id="inp-repo" placeholder="maroubao/wxread" autocomplete="off" spellcheck="false" />
+            </label>
+            <label class="field">
+              <span>Fine-grained token（contents + actions 写权限，只存本机）</span>
+              <input type="password" id="inp-token" autocomplete="off" spellcheck="false" />
+            </label>
+          </div>
+          <div class="cols">
+            <label class="field">
+              <span>状态密钥（base64，与 Secret WXREAD_STATE_KEY 相同）</span>
+              <input type="password" id="inp-statekey" autocomplete="off" spellcheck="false" />
+            </label>
+            <label class="field">
+              <span>状态分支</span>
+              <input type="text" id="inp-branch" value="wxread-state" autocomplete="off" spellcheck="false" />
+            </label>
+          </div>
+          <div class="actions">
+            <button type="button" class="primary" id="btn-connect">连接并保存</button>
+            <button type="button" id="btn-forget">清除本机凭据</button>
+          </div>
+          <p class="sub" style="color: var(--text-3); font-size: var(--fs-xs); margin: var(--sp-3) 0 0">
+            凭据只写在浏览器 localStorage；页面所有读写都直连 GitHub REST，不经过任何中间服务器。
+          </p>
+        </div>
+      </section>
+
+      <section aria-labelledby="metric-title">
+        <h2 id="metric-title">今日概览</h2>
+        <div class="grid">
+          <div class="card metric">
+            <div class="label">今日已读</div>
+            <div class="value num" id="m-read">—</div>
+            <div class="hint" id="m-read-hint">目标 40 次 / 账户</div>
+          </div>
+          <div class="card metric">
+            <div class="label">启用账户</div>
+            <div class="value num" id="m-accounts">—</div>
+            <div class="hint" id="m-accounts-hint">状态 ok 的账户数</div>
+          </div>
+          <div class="card metric">
+            <div class="label">最近一次运行</div>
+            <div class="value num" id="m-last">—</div>
+            <div class="hint" id="m-last-hint">等待数据</div>
+          </div>
+          <div class="card metric">
+            <div class="label">需要登录</div>
+            <div class="value num" id="m-needs">—</div>
+            <div class="hint">扫码后自动恢复</div>
+          </div>
+        </div>
+      </section>
+
+      <section aria-labelledby="qr-title">
+        <h2 id="qr-title">扫码登录</h2>
+        <div class="card">
+          <div class="qr">
+            <div id="qr-slot"><div class="empty">点下面的按钮申请二维码<br />二维码写入状态分支后在此显示</div></div>
+            <div>
+              <label class="field">
+                <span>账户备注（≤24 字）</span>
+                <input type="text" id="inp-qr-label" maxlength="24" placeholder="主号" />
+              </label>
+              <div class="actions">
+                <button type="button" class="primary" id="btn-qr">生成二维码</button>
+                <button type="button" id="btn-qr-poll">刷新二维码</button>
+              </div>
+              <p class="sub" style="color: var(--text-3); font-size: var(--fs-xs); margin: var(--sp-3) 0 0">
+                扫码任务跑在 control.yml 里，约 10 分钟超时；二维码 2 分钟过期，点“刷新二维码”取最新一张。
+              </p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section aria-labelledby="acc-title">
+        <h2 id="acc-title">账户 <span class="count" id="acc-count"></span></h2>
+        <table>
+          <caption class="sub" style="text-align: left; padding: var(--sp-2) var(--sp-3); color: var(--text-3)">
+            每行操作都会立刻下发一条加密指令到 control.yml
+          </caption>
+          <thead>
+            <tr>
+              <th scope="col">账户</th>
+              <th scope="col">状态</th>
+              <th scope="col">目标</th>
+              <th scope="col">最近续期</th>
+              <th scope="col">操作</th>
+            </tr>
+          </thead>
+          <tbody id="acc-body">
+            <tr><td colspan="5" class="sub">连接后显示账户列表</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section aria-labelledby="set-title">
+        <h2 id="set-title">计划与通知</h2>
+        <div class="cols">
+          <div class="card">
+            <h2 style="font-size: var(--fs-body)">计划</h2>
+            <label class="field">
+              <span>每日时间（北京时间，HH:MM）</span>
+              <input type="time" id="inp-daily" value="01:07" />
+            </label>
+            <label class="field">
+              <span>保活间隔（小时）</span>
+              <select id="inp-warm">
+                <option value="6" selected>6</option>
+                <option value="3">3</option>
+                <option value="12">12</option>
+                <option value="0">关闭</option>
+              </select>
+            </label>
+            <div class="actions"><button type="button" id="btn-schedule">保存计划</button></div>
+          </div>
+          <div class="card">
+            <h2 style="font-size: var(--fs-body)">通知</h2>
+            <label class="field">
+              <span>渠道（逗号分隔：email, pushplus, feishu, telegram）</span>
+              <input type="text" id="inp-channels" placeholder="email,feishu" autocomplete="off" />
+            </label>
+            <div class="actions">
+              <button type="button" id="btn-notify">保存渠道</button>
+              <button type="button" id="btn-test-mail">测试邮件</button>
+              <button type="button" id="btn-test-push">测试推送</button>
+            </div>
+            <p class="sub" style="color: var(--text-3); font-size: var(--fs-xs); margin: var(--sp-3) 0 0">
+              渠道口令（SMTP、webhook、bot token）写在状态分支的 settings.enc.json 里，走加密指令下发。
+            </p>
+          </div>
+        </div>
+      </section>
+
+      <section aria-labelledby="run-title">
+        <h2 id="run-title">最近运行</h2>
+        <div class="card">
+          <div class="bars" id="run-bars" role="img" aria-label="最近 14 天读取量"></div>
+          <div class="legend"><span><span class="dot run"></span> 今天</span><span>过去 14 天</span></div>
+          <ol class="runs" id="run-list"><li class="sub">连接后显示运行记录</li></ol>
+        </div>
+      </section>
+
+      <p id="status-message" role="status" aria-live="polite">未连接。填入仓库与 token 后点“连接并保存”。</p>
+    </div>
+
+    <script type="module" src="app.js"></script>
+  </body>
+</html>
