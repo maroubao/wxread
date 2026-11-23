@@ -268,30 +268,31 @@ def handle_update(ctx: ControlContext, payload: Mapping[str, Any]) -> dict:
     account_id = str(payload.get("account_id") or "")
     if not account_id:
         raise ControlError("update 需要 account_id")
-    raw = ctx.store.load_account(account_id)
-    if not raw:
-        raise ControlError(f"账户不存在 {account_id}")
-    account = Account.from_dict(raw)
-    if "label" in payload:
-        account.label = str(payload["label"])[:24]
-    if "target_count" in payload:
-        account.target_count = clamp_target_count(payload["target_count"])
-    if "enabled" in payload:
-        account.enabled = bool(payload["enabled"])
-    if "status" in payload:
-        status = str(payload["status"])
-        if status not in {"ok", "needs_login", "stopped"}:
-            raise ControlError(f"非法状态 {status}")
-        account.status = status
-    if "note" in payload:
-        account.note = str(payload["note"])[:200]
-    if "read_payload" in payload:
-        merged = dict(account.read_payload)
-        merged.update({k: str(v) for k, v in dict(payload["read_payload"]).items() if v})
-        account.read_payload = merged
-    account.validate()
-    ctx.store.save_account(account.to_dict(), message="control: update")
-    return {"ok": True, "account_id": account.id, "label": account.label}
+
+    def update(raw: dict | None) -> dict:
+        if raw is None:
+            raise ControlError(f"账户不存在 {account_id}")
+        account = Account.from_dict(raw)
+        if "label" in payload:
+            account.label = str(payload["label"])[:24]
+        if "target_count" in payload:
+            account.target_count = clamp_target_count(payload["target_count"])
+        if "enabled" in payload:
+            account.enabled = bool(payload["enabled"])
+        if "status" in payload:
+            status = str(payload["status"])
+            if status not in {"ok", "needs_login", "stopped"}:
+                raise ControlError(f"非法状态 {status}")
+            account.status = status
+        if "note" in payload:
+            account.note = str(payload["note"])[:200]
+        if "read_payload" in payload:
+            account.read_payload.update({k: str(v) for k, v in dict(payload["read_payload"]).items() if v})
+        account.validate()
+        return account.to_dict()
+
+    saved = ctx.store.mutate_account(account_id, update, "control: update")
+    return {"ok": True, "account_id": account_id, "label": saved["label"]}
 
 
 def handle_delete(ctx: ControlContext, payload: Mapping[str, Any]) -> dict:
@@ -305,47 +306,54 @@ def handle_delete(ctx: ControlContext, payload: Mapping[str, Any]) -> dict:
 
 
 def handle_schedule(ctx: ControlContext, payload: Mapping[str, Any]) -> dict:
-    settings = ctx.store.load_settings()
-    schedule = dict(settings.get("schedule") or {})
-    if "enabled" in payload:
-        schedule["enabled"] = bool(payload["enabled"])
-    if payload.get("daily"):
-        hour, _, minute = str(payload["daily"]).partition(":")
-        if not hour.isdigit() or not minute.isdigit():
-            raise ControlError("daily 需形如 01:07")
-        schedule["daily"] = f"{int(hour):02d}:{int(minute):02d}"
-    if "warm_hours" in payload:
-        hours = int(payload["warm_hours"])
-        if hours not in (0, 1, 3, 6, 12):
-            raise ControlError("warm_hours 只允许 0/1/3/6/12")
-        schedule["warm_hours"] = hours
-    schedule.setdefault("daily", DEFAULT_DAILY)
-    schedule.setdefault("warm_hours", DEFAULT_WARM_HOURS)
-    settings["schedule"] = schedule
-    settings["updated_at"] = ctx.now_iso()
-    ctx.store.save_settings(settings)
-    return {"ok": True, "schedule": schedule}
+    def update(settings: dict) -> dict:
+        schedule = dict(settings.get("schedule") or {})
+        if "enabled" in payload:
+            schedule["enabled"] = bool(payload["enabled"])
+        if payload.get("daily"):
+            hour, separator, minute = str(payload["daily"]).partition(":")
+            if not separator or not hour.isdigit() or not minute.isdigit():
+                raise ControlError("daily 需形如 01:07")
+            if not 0 <= int(hour) <= 23 or not 0 <= int(minute) <= 59:
+                raise ControlError("daily 超出时间范围")
+            schedule["daily"] = f"{int(hour):02d}:{int(minute):02d}"
+        if "warm_hours" in payload:
+            hours = int(payload["warm_hours"])
+            if hours not in (0, 1, 3, 6, 12):
+                raise ControlError("warm_hours 只允许 0/1/3/6/12")
+            schedule["warm_hours"] = hours
+        schedule.setdefault("daily", DEFAULT_DAILY)
+        schedule.setdefault("warm_hours", DEFAULT_WARM_HOURS)
+        settings["schedule"] = schedule
+        settings["updated_at"] = ctx.now_iso()
+        return settings
+
+    settings = ctx.store.mutate_settings(update)
+    return {"ok": True, "schedule": settings["schedule"]}
 
 
 def handle_notifications(ctx: ControlContext, payload: Mapping[str, Any]) -> dict:
-    settings = ctx.store.load_settings()
-    block = dict(settings.get("notifications") or {})
-    if "enabled" in payload:
-        block["enabled"] = bool(payload["enabled"])
-    if "channels" in payload:
-        channels = [str(item) for item in payload["channels"]]
-        unknown = [item for item in channels if item not in notify.CHANNELS]
-        if unknown:
-            raise ControlError(f"未知渠道 {unknown}")
-        block["channels"] = channels
-    for channel in notify.CHANNELS:
-        if channel in payload and isinstance(payload[channel], Mapping):
-            merged = dict(block.get(channel) or {})
-            merged.update(dict(payload[channel]))
-            block[channel] = merged
-    settings["notifications"] = block
-    settings["updated_at"] = ctx.now_iso()
-    ctx.store.save_settings(settings)
+    def update(settings: dict) -> dict:
+        block = dict(settings.get("notifications") or {})
+        if "enabled" in payload:
+            block["enabled"] = bool(payload["enabled"])
+        if "channels" in payload:
+            channels = [str(item) for item in payload["channels"]]
+            unknown = [item for item in channels if item not in notify.CHANNELS]
+            if unknown:
+                raise ControlError(f"未知渠道 {unknown}")
+            block["channels"] = channels
+        for channel in notify.CHANNELS:
+            if channel in payload and isinstance(payload[channel], Mapping):
+                merged = dict(block.get(channel) or {})
+                merged.update(dict(payload[channel]))
+                block[channel] = merged
+        settings["notifications"] = block
+        settings["updated_at"] = ctx.now_iso()
+        return settings
+
+    settings = ctx.store.mutate_settings(update)
+    block = settings["notifications"]
     safe = {k: ({"configured": True} if k in notify.CHANNELS else v) for k, v in block.items()}
     return {"ok": True, "notifications": safe}
 

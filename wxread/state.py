@@ -15,10 +15,12 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import logging
+from copy import deepcopy
 from datetime import datetime, timezone
-from typing import Any, Iterable, Mapping, Protocol, runtime_checkable
+from typing import Any, Callable, Iterable, Mapping, Protocol, runtime_checkable
 
 import requests
 
@@ -292,6 +294,34 @@ class StateStore:
         data = json.dumps(envelope, ensure_ascii=False, sort_keys=True).encode("utf-8")
         self._cas_write(path, data, message, create_only=create_only, sealed=True)
 
+    def mutate_encrypted(
+        self,
+        path: str,
+        update: Callable[[dict | None], Mapping[str, Any] | None],
+        message: str,
+    ) -> dict | None:
+        """在与 sha 对应的最新明文上变更，冲突后重新计算变更。"""
+        self.ensure_ready()
+        for _attempt in range(self.retries):
+            raw, sha = self.backend.get(path)
+            try:
+                current = self._decrypt(json.loads(raw.decode("utf-8")), path) if raw is not None else None
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise StateReadError(f"{path} 密文容器不是合法 JSON") from exc
+            updated = update(deepcopy(current))
+            if updated is None or updated == current:
+                return updated
+            envelope = crypto.encrypt_state(updated, self._keys[self.key_version], self._ctx(self.key_version), self.key_version)
+            data = json.dumps(envelope, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            try:
+                self.backend.put(path, data, message, sha=sha, create_only=sha is None)
+                return dict(updated)
+            except Conflict:
+                saved, _ = self.backend.get(path)
+                if saved == data:
+                    return dict(updated)
+        raise StateWriteError(f"{path} 变更失败（{self.retries} 次并发重试）")
+
     def _cas_write(self, path: str, data: bytes, message: str, create_only: bool, sealed: bool = False) -> None:
         self.ensure_ready()
         last_error: Exception | None = None
@@ -345,6 +375,9 @@ class StateStore:
     def save_settings(self, settings: Mapping[str, Any]) -> None:
         self.write_encrypted(SETTINGS_PATH, settings, "chore(state): settings")
 
+    def mutate_settings(self, update: Callable[[dict], dict]) -> dict:
+        return self.mutate_encrypted(SETTINGS_PATH, lambda current: update(current or {}), "chore(state): settings") or {}
+
     # -- accounts
 
     @staticmethod
@@ -357,6 +390,9 @@ class StateStore:
 
     def load_account(self, account_id: str) -> dict | None:
         return self.read_encrypted(self.account_path(account_id))
+
+    def mutate_account(self, account_id: str, update: Callable[[dict | None], Mapping | None], message: str) -> dict | None:
+        return self.mutate_encrypted(self.account_path(account_id), update, message)
 
     def load_accounts(self) -> dict[str, dict]:
         result: dict[str, dict] = {}
@@ -405,10 +441,26 @@ class StateStore:
     def append_run(self, record: Mapping[str, Any], keep: int = RUNS_KEEP) -> None:
         started_at = str(record.get("started_at") or utcnow_iso())
         month = started_at[:7]
-        records = self.load_runs(month)
-        records.insert(0, dict(record))
-        del records[max(keep, 1) :]
-        self.write_encrypted(self._runs_path(month), {"month": month, "runs": records}, "chore(state): runs")
+        saved_record = dict(record)
+        saved_record.setdefault("started_at", started_at)
+        identity = saved_record.get("run_id") or hashlib.sha256(
+            json.dumps(saved_record, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        ).hexdigest()
+        saved_record["run_id"] = identity
+
+        def append(current: dict | None) -> dict:
+            current = current or {"month": month, "runs": []}
+            records = current.get("runs")
+            if not isinstance(records, list):
+                raise StateReadError(f"runs/{month} 结构异常")
+            if any(item.get("run_id") == identity for item in records):
+                return current
+            records.insert(0, saved_record)
+            records.sort(key=lambda item: str(item.get("started_at", "")), reverse=True)
+            del records[max(keep, 1) :]
+            return {"month": month, "runs": records}
+
+        self.mutate_encrypted(self._runs_path(month), append, "chore(state): runs")
 
     def recent_runs(self, limit: int = 20, months: Iterable[str] | None = None) -> list[dict]:
         if months is None:
