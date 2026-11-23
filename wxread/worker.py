@@ -291,14 +291,22 @@ def cmd_control(store: StateStore, env: Mapping[str, str], *, qr_page_factory=No
         notify_send=notify_send,
     )
     if action == "init":
-        if _env(env, "WXREAD_CONTROL_SK"):
-            log.warning("init 会生成新密钥对；已有 WXREAD_CONTROL_SK 时请直接用 instruction")
-        result = control_mod.handle_init(ctx, {})
-        print(f"::notice::control public_key={result['public_key']} key_version={result['key_version']}", flush=True)
-        if not result.get("reused"):
-            print(f"::add-mask::{result['server_secret_key']}", flush=True)
-            print(f"private_key={result['server_secret_key']}")
-            log.warning("把上面的 private_key 存进 Secret WXREAD_CONTROL_SK（只显示这一次）")
+        # 私钥绝不出现在日志里：public 仓库的 Actions 日志是全网可见的。
+        # 密钥对在本机用 scripts/keygen.py 生成，只有公钥进 workflow 输入。
+        supplied = _env(env, "WXREAD_INIT_PUBLIC_KEY")
+        existing = store.load_control()
+        if not supplied and not (existing and existing.get("public_key")):
+            raise ConfigError(
+                "init 需要 public_key：先在本机跑 python scripts/keygen.py，把输出的 public_key "
+                "填进 workflow 的 public_key 输入，private_key 存进 Secret WXREAD_CONTROL_SK"
+            )
+        result = control_mod.handle_init(ctx, {"public_key": supplied} if supplied else {})
+        print(
+            f"::notice::control public_key={result['public_key']} key_version={result['key_version']}",
+            flush=True,
+        )
+        if result.get("rotated"):
+            print("::notice::control 公钥已替换，旧私钥失效；请更新 Secret WXREAD_CONTROL_SK", flush=True)
         return EXIT_OK
 
     instruction_text = _env(env, "WXREAD_INSTRUCTION")

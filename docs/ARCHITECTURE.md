@@ -187,7 +187,7 @@ main.py:250-260 ──▶ run() main.py:199-247
 1. 页面 GET `wxread-state/control.json`；不存在 → 展示"初始化"。
 2. 页面生成 X25519 密钥对 → 用 `secrets` 公钥（Actions 侧公钥，用户从仓库设置页复制）封私钥 → 用户点"写入密钥"，页面用 PAT 写 `WXREAD_CONTROL_KEY`（需 `secrets:write`，仅此一次）。
 3. 页面用 PAT 写 `WXREAD_STATE_KEY`（32B 随机，页面生成）—— 状态对称密钥不再从私钥派生。
-4. 页面 dispatch `control.yml` 动作 `init`；worker 生成 `control.json`（公钥 + `key_version=1`）。
+4. 本机 `scripts/keygen.py` 生成密钥对；页面或 workflow 只把**公钥**交给 worker，动作 `init` 写 `control.json`（公钥 + `key_version=1`）。私钥永不进日志。
 5. 页面轮询 `runs` 最新回执，解出 `ready`。
 
 ### 4.2 扫码绑定

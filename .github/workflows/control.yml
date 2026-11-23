@@ -23,6 +23,10 @@ on:
         required: false
         default: "600"
         type: string
+      public_key:
+        description: "init 用：本机 scripts/keygen.py 生成的 public_key（私钥留在本机）"
+        required: false
+        type: string
 
 # 同一 session 只跑一个；不同 session 互不阻塞
 concurrency:
@@ -67,6 +71,7 @@ jobs:
           WXREAD_CONTROL_SK: ${{ secrets.WXREAD_CONTROL_SK }}
           WXREAD_SESSION: ${{ github.event.inputs.session_id }}
           WXREAD_QR_SECONDS: ${{ github.event.inputs.qr_seconds }}
+          WXREAD_INIT_PUBLIC_KEY: ${{ github.event.inputs.public_key }}
           WXREAD_QR_DIR: qr-out
         run: python -m wxread.worker control
 

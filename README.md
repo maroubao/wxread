@@ -27,7 +27,7 @@ control.yml  手动/页面 ─┘                 accounts/ settings/ runs/ resp
    python -c "import os,base64;print(base64.b64encode(os.urandom(32)).decode())"
    ```
 
-2. 跑一次 `control.yml`，`control = init`；把打印的 `private_key` 存进 Secret `WXREAD_CONTROL_SK`。
+2. 本机 `python scripts/keygen.py` 生成密钥对，私钥存进 Secret `WXREAD_CONTROL_SK`；再跑一次 `control.yml`（`control = init`）并填入输出的 `public_key`。
 3. Settings → Pages → Source 选 **GitHub Actions**；打开部署好的页面，填仓库 / token / 状态密钥 → 连接。
 4. 点"生成二维码"→ 微信扫码；再导入一次 curl 补全 `appId/ps/pc`（扫码只给 cookie）。
 5. 点"立即运行"验证一次，之后交给定时任务。

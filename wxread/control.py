@@ -34,6 +34,7 @@ ACTIONS = (
 DEFAULT_SKEW = 60
 DEFAULT_DAILY = "01:07"
 DEFAULT_WARM_HOURS = 6
+PUBLIC_KEY_LEN = 32
 
 
 class ControlError(RuntimeError):
@@ -110,9 +111,37 @@ def _accounts_as_dicts(store: StateStore) -> dict[str, dict]:
 
 
 def handle_init(ctx: ControlContext, payload: Mapping[str, Any]) -> dict:
+    """建或换指令密钥对。
+
+    公钥可以由调用方给（`payload["public_key"]`，本地 genkey 生成后传入）；
+    不给才在进程内生成——但生成路径的私钥只能在本机用，CI 日志是公开的，
+    `cmd_control` 因此拒绝在无公钥时走这条路。
+    """
     control = ctx.store.load_control()
-    if control and control.get("public_key"):
-        return {"public_key": control["public_key"], "key_version": control.get("key_version", 1), "reused": True}
+    stored = control.get("public_key") if control else None
+    supplied = payload.get("public_key")
+    if supplied:
+        try:
+            public = b64d(str(supplied))
+        except (ValueError, CryptoFailure) as exc:
+            raise ControlError("public_key 不是合法 base64") from exc
+        if len(public) != PUBLIC_KEY_LEN:
+            raise ControlError(f"public_key 必须是 {PUBLIC_KEY_LEN} 字节")
+        text = b64e(public)
+        if stored == text:
+            return {"public_key": text, "key_version": (control or {}).get("key_version", 1), "reused": True}
+        saved = ctx.store.save_control(public)
+        # 旧私钥随即失效：页面必须用新公钥重新封指令
+        return {
+            "public_key": saved["public_key"],
+            "key_version": saved.get("key_version", 1),
+            "reused": False,
+            "rotated": bool(stored),
+        }
+
+    if stored:
+        return {"public_key": stored, "key_version": (control or {}).get("key_version", 1), "reused": True}
+
     from .crypto import new_keypair
 
     public, secret = new_keypair()

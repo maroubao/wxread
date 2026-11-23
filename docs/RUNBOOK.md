@@ -28,18 +28,27 @@ warm.yml  (每 6 小时)       --> worker warm  --> 只更新 accounts/*.enc.jso
    | Secret | 说明 |
    | --- | --- |
    | `WXREAD_STATE_KEY` | 上一步的 base64，32 字节 |
-   | `WXREAD_CONTROL_SK` | 下一步 `init` 打印出来的私钥（base64） |
+   | `WXREAD_CONTROL_SK` | 第 4 步本机 `keygen.py` 输出的私钥（base64） |
 
 3. **开 Pages**：Settings → Pages → Source 选 **GitHub Actions**（`pages.yml` 会部署 `web/`）。
 
-4. **生成指令密钥对**：Actions → `control` → Run workflow，`control = init`。跑完在日志里看：
+4. **生成指令密钥对（在本机，不在 CI）**：
+
+   ```bash
+   python scripts/keygen.py
+   # public_key=<base64>   → 下一步填进 workflow 输入
+   # private_key=<base64>  → 存进 Secret WXREAD_CONTROL_SK，只留在本机
+   ```
+
+   **私钥不能由 Actions 打印**：public 仓库的 Actions 日志是全网可读的。所以 `init` 只接收公钥：
+
+   Actions → `control` → Run workflow → `control = init`，把 `public_key` 贴进 `public_key` 输入框。日志会出现：
 
    ```text
    ::notice::control public_key=<base64> key_version=1
-   private_key=<base64>          ← 只显示这一次，立刻存进 WXREAD_CONTROL_SK
    ```
 
-   `public_key` 会写到状态分支 `control.json`（明文，公钥本就该公开）。
+   `public_key` 写到状态分支 `control.json`（明文，公钥本就该公开）。换钥就再跑一次并填新公钥，旧私钥立即失效（日志会提示 `公钥已替换`）。
 
 5. **绑定第一个账户**（二选一）：
 
