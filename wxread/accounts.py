@@ -182,6 +182,8 @@ class Account:
     def mark_ok(self, when: str | None = None) -> None:
         self.last_ok_at = when or utcnow_iso()
         self.status = STATUS_OK
+        self.note = ""
+        self.extra.update({"warm_failures": 0, "warm_notified": False})
 
     def mark_needs_login(self, note: str = "") -> None:
         self.status = STATUS_NEEDS_LOGIN
@@ -197,6 +199,7 @@ class Account:
             self.label = other.label
         if other.status == STATUS_OK:
             self.status = STATUS_OK
+            self.extra.update({"warm_failures": 0, "warm_notified": False})
         self.renewed_at = other.renewed_at or self.renewed_at
 
 

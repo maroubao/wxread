@@ -269,7 +269,22 @@ def cmd_warm(store: StateStore, env: Mapping[str, str], transport_factory=None, 
     for result in summary.results:
         if result.reason == warm_mod.WARM_REASON_FAILED:
             print(f"::error title=wxread 保活失败::{result.label or result.account_id} {result.note}", flush=True)
-    return EXIT_OK if summary.failed == 0 else EXIT_ALL_FAILED
+    pending = [result for result in summary.results if result.notify]
+    if pending:
+        from . import notify
+        settings = store.load_settings()
+        for result in pending:
+            title, message = notify.render_failure(result.label or result.account_id, result.note, "重新扫码后会恢复每日阅读")
+            deliveries = notify.dispatch(settings, title, message)
+            if all(delivery.ok for delivery in deliveries):
+                def mark_notified(current: dict | None) -> dict | None:
+                    if current is not None and current.get("status") == "needs_login" and int(current.get("warm_failures", 0)) >= 2:
+                        current["warm_notified"] = True
+                    return current
+                store.mutate_account(result.account_id, mark_notified, "chore(state): warm notification")
+    if any(result.reason == warm_mod.WARM_REASON_STATE for result in summary.results):
+        return EXIT_STATE
+    return EXIT_ALL_FAILED if summary.failed and not summary.warmed else EXIT_OK
 
 
 def qr_frame_path(session: str, seq: int, fingerprint: str) -> str:

@@ -253,13 +253,13 @@ class Reader:
                 network_failures += 1
                 log.warning("renewal 变体失败：%s", scrub(str(exc)))
                 continue
-            # 只认"本次响应新下发的" skey：沿用旧值会让过期会话假装续期成功
+            if response.payload.get("errcode", response.payload.get("errCode")) in SESSION_ERRCODES:
+                invalid_session = True
+                continue
             skey = (response.set_cookies or {}).get("wr_skey") or response.payload.get("wr_skey")
             if skey and str(skey).strip():
                 self.account.cookies["wr_skey"] = str(skey)
                 return str(skey)
-            if response.payload.get("errcode", response.payload.get("errCode")) in SESSION_ERRCODES:
-                invalid_session = True
             if response.payload.get("succ") == 1 and self.account.cookies.get("wr_skey"):
                 return self.account.cookies["wr_skey"]
         if invalid_session:
