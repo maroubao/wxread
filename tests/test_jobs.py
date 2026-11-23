@@ -12,6 +12,7 @@ from wxread.jobs import JobRunner
 
 from support import CURL_SAMPLE, MemoryContents
 from test_reader import FakeTransport, ok
+from wxread.reader import TransportResponse
 
 STATE_KEY = base64.b64encode(b"k" * 32).decode("ascii")
 
@@ -138,3 +139,92 @@ def test_all_accounts_failed_returns_1():
 
     factory = lambda: FakeTransport([TransportError("x")] * 100)
     assert worker.cmd_read(store, env, transport_factory=factory, sleep=lambda _s: None) == worker.EXIT_ALL_FAILED
+
+
+def test_unexpected_account_failure_persists_cookies_and_continues_batch():
+    _backend, store = make_store(env_base())
+    first = account_from_curl(CURL_SAMPLE)
+    first.target_count = 2
+    second = account_from_curl(CURL_SAMPLE.replace("wr_vid=1234567890", "wr_vid=1111111111"))
+    second.target_count = 1
+    transports = iter([
+        FakeTransport([TransportResponse(200, {"succ": 1, "synckey": "sync"}, {"wr_skey": "rotated"}), RuntimeError("unexpected")]),
+        FakeTransport([ok()]),
+    ])
+    records = JobRunner(store, transport_factory=lambda: next(transports), pace=0).run([first, second])
+    assert len(records) == 2 and records[1]["read_count"] == 1
+    assert store.load_account(first.id)["cookies"]["wr_skey"] == "rotated"
+    assert records[0]["read_count"] == 1 and records[0]["reason"] == "internal_error"
+
+
+def test_interrupt_saves_progress_and_reraises():
+    _backend, store = make_store(env_base())
+    account = account_from_curl(CURL_SAMPLE)
+    account.target_count = 2
+    transport = FakeTransport([TransportResponse(200, {"succ": 1, "synckey": "sync"}, {"wr_skey": "rotated"}), KeyboardInterrupt()])
+    with pytest.raises(KeyboardInterrupt):
+        JobRunner(store, transport_factory=lambda: transport, pace=0).run([account])
+    assert store.load_account(account.id)["cookies"]["wr_skey"] == "rotated"
+    record = store.recent_runs()[0]
+    assert record["read_count"] == 1 and record["reason"] == "cancelled"
+
+
+def test_running_account_does_not_overwrite_a_concurrent_edit():
+    from wxread import control
+
+    _backend, store = make_store(env_base())
+    account = account_from_curl(CURL_SAMPLE, label="旧备注")
+    account.target_count = 1
+    store.save_account(account)
+
+    class EditingTransport(FakeTransport):
+        def post(self, *args):
+            control.handle_update(control.ControlContext(store), {"account_id": account.id, "label": "新备注", "enabled": False})
+            return ok()
+
+    JobRunner(store, transport_factory=EditingTransport, pace=0).run([account])
+    saved = store.load_account(account.id)
+    assert saved["label"] == "新备注" and saved["enabled"] is False
+
+
+def test_deleted_account_is_not_recreated_by_final_write():
+    _backend, store = make_store(env_base())
+    account = account_from_curl(CURL_SAMPLE)
+    account.target_count = 1
+    store.save_account(account)
+
+    class DeletingTransport(FakeTransport):
+        def post(self, *args):
+            store.delete_account(account.id)
+            return ok()
+
+    JobRunner(store, transport_factory=DeletingTransport, pace=0).run([account])
+    assert store.load_account(account.id) is None
+    assert store.recent_runs()[0]["read_count"] == 1
+
+
+def test_rebinding_during_a_run_preserves_the_new_login():
+    from wxread import control
+
+    _backend, store = make_store(env_base())
+    account = account_from_curl(CURL_SAMPLE)
+    account.target_count = 2
+    store.save_account(account)
+
+    class RebindingTransport(FakeTransport):
+        def post(self, *args):
+            control.handle_import(control.ControlContext(store), {"curl": CURL_SAMPLE.replace("wr_skey=abcdefghij", "wr_skey=rebound-session")})
+            return TransportResponse(200, {"succ": 1, "synckey": "sync"}, {"wr_skey": "old-session-rotation"})
+
+    record = JobRunner(store, transport_factory=RebindingTransport, pace=0).run([account])[0]
+    assert store.load_account(account.id)["cookies"]["wr_skey"] == "rebound-session"
+    assert record["read_count"] == 1 and record["reason"] == "cancelled"
+
+
+def test_one_corrupt_account_does_not_prevent_loading_the_others():
+    env = env_base()
+    _backend, store = make_store(env)
+    account = account_from_curl(CURL_SAMPLE)
+    store.save_account(account)
+    store.save_account({"id": "broken", "cookies": "not-an-object"})
+    assert [item.id for item in worker.load_accounts(store, env)] == [account.id]

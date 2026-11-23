@@ -50,7 +50,7 @@ def utcnow_iso() -> str:
 
 
 def _clean_label(label: str | None) -> str:
-    text = (label or "").strip()
+    text = str(label or "").strip()
     return text[:LABEL_MAX_LEN]
 
 

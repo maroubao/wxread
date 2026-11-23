@@ -26,7 +26,9 @@ import base64
 import json
 import logging
 import os
+import signal
 import sys
+import threading
 from typing import Mapping
 
 from .crypto import CryptoFailure, b64d
@@ -121,12 +123,16 @@ def build_store(env: Mapping[str, str], backend=None) -> StateStore:
 def load_accounts(store: StateStore, env: Mapping[str, str]) -> list[Account]:
     """状态分支里已有的账户优先；为空时才读旧 secret（并迁移）。"""
     accounts: list[Account] = []
-    for account_id, payload in store.load_accounts().items():
+    account_ids = store.list_account_ids()
+    for account_id in account_ids:
         try:
+            payload = store.load_account(account_id)
+            if payload is None:
+                continue
             accounts.append(Account.from_dict(payload, account_id))
-        except AccountError as exc:
+        except (AccountError, StateError, ValueError, TypeError) as exc:
             log.error("账户 %s 数据损坏：%s", account_id, scrub(str(exc)))
-    if accounts:
+    if account_ids:
         return sorted(accounts, key=lambda item: item.id)
 
     legacy_curl = _env(env, "WXREAD_CURL_BASH")
@@ -216,7 +222,15 @@ def cmd_read(store: StateStore, env: Mapping[str, str], transport_factory=None, 
         **({"sleep": sleep} if sleep is not None else {}),
     )
     started = utcnow_iso()
-    records = runner.run(accounts)
+    previous_handlers = {}
+    if threading.current_thread() is threading.main_thread():
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            previous_handlers[signum] = signal.signal(signum, lambda _signum, _frame: runner.cancel())
+    try:
+        records = runner.run(accounts)
+    finally:
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
     total = sum(int(record.get("read_count", 0)) for record in records)
     failed = [record for record in records if int(record.get("exit_code", 0)) not in (0, 2)]
     state_errors = [record for record in records if int(record.get("exit_code", 0)) == EXIT_STATE]

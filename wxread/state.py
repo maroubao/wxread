@@ -158,7 +158,10 @@ class GitHubContents:
     # -- 接口
 
     def get(self, path: str) -> tuple[bytes | None, str | None]:
-        resp = self._session.get(self._url(path), params={"ref": self.branch}, timeout=self._timeout)
+        try:
+            resp = self._session.get(self._url(path), params={"ref": self.branch}, timeout=self._timeout)
+        except requests.RequestException as exc:
+            raise StateReadError(f"读取 {path} 网络失败：{type(exc).__name__}") from exc
         if resp.status_code == 404:
             return None, None
         if resp.status_code != 200:
@@ -174,7 +177,10 @@ class GitHubContents:
         return raw, payload.get("sha")
 
     def list(self, directory: str) -> list[str]:
-        resp = self._session.get(self._url(directory), params={"ref": self.branch}, timeout=self._timeout)
+        try:
+            resp = self._session.get(self._url(directory), params={"ref": self.branch}, timeout=self._timeout)
+        except requests.RequestException as exc:
+            raise StateReadError(f"列目录 {directory} 网络失败：{type(exc).__name__}") from exc
         if resp.status_code == 404:
             return []
         if resp.status_code != 200:
@@ -202,7 +208,10 @@ class GitHubContents:
             body["sha"] = sha
         elif create_only:
             headers["If-None-Match"] = "*"
-        resp = self._session.put(self._url(path), json=body, headers=headers, timeout=self._timeout)
+        try:
+            resp = self._session.put(self._url(path), json=body, headers=headers, timeout=self._timeout)
+        except requests.RequestException as exc:
+            raise Conflict(f"写入 {path} 响应中断：{type(exc).__name__}") from exc
         if resp.status_code in (409, 412, 422):
             raise Conflict(f"写入 {path} 冲突：HTTP {resp.status_code}")
         if resp.status_code not in (200, 201):
@@ -432,6 +441,35 @@ class StateStore:
             raise StateError("账户缺少 id")
         text = message or f"chore(state): account {account_id}"
         self.write_encrypted(self.account_path(str(account_id)), account, text)
+
+    def save_account_runtime(self, account: Mapping[str, Any], baseline: Mapping | None, message: str) -> dict | None:
+        """合并运行时字段，保留同期控制指令的修改与重新绑定的凭据。"""
+        previous = baseline or {}
+        fields = ("cookies", "renewed_at", "last_ok_at", "status", "note", "progress", "warm_failures", "warm_notified")
+
+        def update(current: dict | None) -> dict | None:
+            if current is None:
+                return dict(account) if baseline is None else None
+            credential_changed = current.get("cookies") != previous.get("cookies") and current.get("cookies") != account.get("cookies")
+            for name in fields:
+                if name not in account or account.get(name) == previous.get(name):
+                    continue
+                if credential_changed and name in {"cookies", "renewed_at", "status", "note"}:
+                    continue
+                value = account[name]
+                old = previous.get(name)
+                if isinstance(value, dict):
+                    existing = dict(current.get(name) or {})
+                    old = old if isinstance(old, dict) else {}
+                    for key, item in value.items():
+                        if item != old.get(key) and existing.get(key) == old.get(key):
+                            existing[key] = item
+                    current[name] = existing
+                elif current.get(name) == old:
+                    current[name] = value
+            return current
+
+        return self.mutate_account(str(account["id"]), update, message)
 
     def delete_account(self, account_id: str, message: str | None = None) -> None:
         path = self.account_path(account_id)
