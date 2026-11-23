@@ -3,6 +3,13 @@
 
 const API = "https://api.github.com";
 
+// fine-grained token 的到期时间由 GitHub 在响应头里回传；CORS 允许时才有值。
+let tokenExpiry = null;
+
+export function getTokenExpiry() {
+  return tokenExpiry;
+}
+
 export class GhError extends Error {
   constructor(message, status, body) {
     super(message);
@@ -39,6 +46,8 @@ async function request(path, { token, method = "GET", body, accept } = {}) {
     body: body ? JSON.stringify(body) : undefined,
   });
   if (response.status === 204) return null;
+  const expiry = response.headers.get("github-authentication-token-expiration");
+  if (expiry) tokenExpiry = expiry;
   const text = await response.text();
   let parsed = null;
   try {
@@ -111,7 +120,8 @@ export async function latestBranchCommit({ repo, token, branch }) {
   }
 }
 
-export async function ensureStateBranch({ repo, token, branch }) {  const existing = await latestBranchCommit({ repo, token, branch });
+export async function ensureStateBranch({ repo, token, branch }) {
+  const existing = await latestBranchCommit({ repo, token, branch });
   if (existing) return false;
   const main = await latestBranchCommit({ repo, token, branch: "main" });
   await request(`/repos/${repo}/git/refs`, {

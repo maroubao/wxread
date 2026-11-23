@@ -77,12 +77,32 @@ async function connect() {
     $("conn-dot").className = "dot ok";
     $("conn-text").textContent = repo;
     await refreshAll();
-    say(state.publicKey ? "已连接。" : "已连接，但还没有指令公钥：先跑一次 control.yml（control=init）。", state.publicKey ? "ok" : "warn");
+    const base = state.publicKey ? "已连接。" : "已连接，但还没有指令公钥：先跑一次 control.yml（control=init）。";
+    say(base + expiryNote(), state.publicKey ? "ok" : "warn");
   } catch (error) {
     $("conn-dot").className = "dot bad";
     $("conn-text").textContent = "连接失败";
-    say(`连接失败：${error.message}`, "bad");
+    const hint =
+      error.status === 401
+        ? "（token 过期或权限不足：去 GitHub 重新生成 fine-grained token，只需 contents + actions 写）"
+        : error.status === 404
+          ? "（仓库名写错，或状态分支上还没有 control.json）"
+          : "";
+    say(`连接失败：${error.message}${hint}`, "bad");
   }
+}
+
+// token 到期提醒：GitHub 在响应头里给了到期时间就用它，没给就不显示。
+function expiryNote() {
+  const raw = typeof gh.getTokenExpiry === "function" ? gh.getTokenExpiry() : null;
+  if (!raw) return "";
+  const at = new Date(raw);
+  if (Number.isNaN(at.getTime())) return "";
+  const days = Math.floor((at.getTime() - Date.now()) / 86400000);
+  const text = at.toISOString().slice(0, 10);
+  if (days < 0) return ` token 已于 ${text} 过期，自动任务不受影响，网页需要重新填一个新 token。`;
+  if (days <= 14) return ` token 还有 ${days} 天到期（${text}）。`;
+  return ` token 有效至 ${text}。`;
 }
 
 function forget() {
