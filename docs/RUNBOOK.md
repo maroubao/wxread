@@ -52,8 +52,10 @@ warm.yml  (每 6 小时)       --> worker warm  --> 只更新 accounts/*.enc.jso
 
 5. **绑定第一个账户**（二选一）：
 
-   - **扫码**：打开 Pages 站点 → 填仓库、token、状态密钥 → 点"连接并保存" → "生成二维码" → 微信扫。
-   - **导入 curl**：浏览器 F12 → Network → 复制 `web/book/read` 请求为 cURL → 用本机脚本导入（见下）。
+   - **扫码**：打开 Pages 站点 → 填仓库、token、状态密钥 → 点"连接并保存" → "扫码添加账户" → 微信扫。
+     扫完并确认登录后面板自动收起，账户出现在下表。
+   - **导入 curl**：浏览器 F12 → Network → 复制 `web/book/read` 请求为 cURL → 控制台"导入 cURL"贴进去点导入
+     （或本机 `scripts/control_local.py import --curl-file curl.txt`，见下）。
 
    扫码拿到的账户只有 cookie，缺 `appId/ps/pc`（**必须**再导入一次 curl 才有阅读参数），控制台会把 `note` 标成"扫码账户未带 ps/pc"。
 
@@ -131,8 +133,12 @@ python scripts/live_check.py
    `responses/qr-<session_id>-<seq>-<指纹>.png`，序号保证按名字排序就是时间顺序）；
 3. 二维码出来了但扫码提示失效 → 点"刷新二维码"取最新一张（每 85 秒换码）。
 
-> 改了帧名规则之前留下的 `responses/qr-<指纹>.png` 会在下次点"生成二维码"时被
+> 改了帧名规则之前留下的 `responses/qr-<指纹>.png` 会在下次点"扫码添加账户"时被
 > `worker.purge_stale_qr()` 删掉——那些是带方块浮层的旧图，不删就会继续被误当成新码。
+>
+> **扫码成功后界面会自己收起**：`pollQr` 每轮先看 `responses/<session>.json` 回执，
+> 回执一到就收起二维码区、刷新账户表，不会一直轮询到 15 分钟预算。要再加账户才点
+> "扫码添加账户"重新展开；扫码中想放弃点"取消"（会顺手 cancel 那次 control 运行）。
 
 ### 3.7 二维码上出现一排方块 / 扫不出来
 

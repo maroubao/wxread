@@ -49,3 +49,22 @@ def test_every_element_app_js_touches_exists_in_the_page():
     assert ids, "app.js 里没有 $() 选择器"
     missing = sorted(identifier for identifier in ids if f'id="{identifier}"' not in html)
     assert missing == [], f"index.html 缺少这些 id：{missing}"
+
+
+def test_qr_panel_starts_hidden_and_closes_when_the_receipt_lands():
+    """扫码成功后必须立刻收起二维码区，不能一直轮询到 15 分钟预算烧完。
+
+    回归来源：用户扫码成功后页面还在一张张拉新码，最后报“轮询超时”——因为
+    pollQr 只盯着 responses/qr-*.png，从来没看 responses/<session>.json 这个回执。
+    """
+    html = (WEB / "index.html").read_text(encoding="utf-8")
+    source = (WEB / "app.js").read_text(encoding="utf-8")
+    assert 'id="qr-live" hidden' in html, "扫码区默认必须是收起的"
+    assert 'id="btn-qr-cancel"' in html, "扫码中要能取消"
+    assert "async function qrReceipt(" in source
+    assert "function finishQr(" in source
+    # pollQr 每轮先看回执，再看有没有新帧
+    assert source.index("await qrReceipt(sessionId)") < source.index("await findSessionQr(sessionId)")
+    # 回执到了要收面板，而不是继续排下一次轮询
+    finish = source[source.index("function finishQr(") : source.index("async function qrReceipt(")]
+    assert "showQrPanel(false)" in finish

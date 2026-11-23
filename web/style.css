@@ -160,6 +160,9 @@ textarea { min-height: 88px; font-family: var(--mono); font-size: var(--fs-sm); 
 /* ---- 二维码 ---- */
 .qr { display: flex; gap: var(--sp-4); align-items: flex-start; }
 
+/* 闲置与扫码中互斥：靠 hidden 属性切换，别让 block 的 display 覆盖掉 */
+#qr-idle[hidden], #qr-live[hidden] { display: none; }
+
 .qr img {
   width: 240px; height: 240px;
   border: 1px solid var(--border);

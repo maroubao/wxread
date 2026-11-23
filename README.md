@@ -15,7 +15,7 @@ control.yml  手动/页面 ─┘                 accounts/ settings/ runs/ resp
 - **加密状态**：`crypto_secretbox`（XSalsa20-Poly1305）+ 明文上下文前缀 `wxread-state|<owner>/<repo>|v<kv>`，跨仓库/跨版本搬运直接解密失败。
 - **密文指令**：浏览器里用公钥封指令（`nacl.box`，临时密钥 + 显式 nonce），worker 解封后执行；回执用一次性 `reply_key` 加密回传。
 - **四级失败处理**：L1 退避重试（5/15/45s）→ L2 强制 renewal 补救 → L3 置 `needs_login` + 通知；不会静默失败。
-- **扫码登录**：不用手抄 cookie。控制台点"生成二维码"，Actions 里用 Playwright 打开微信读书登录浮层，二维码写入状态分支后页面轮询显示（每 85 秒自动换码）。
+- **扫码登录**：不用手抄 cookie。控制台点"扫码添加账户"，Actions 里用 Playwright 打开微信读书登录浮层，二维码写入状态分支后页面轮询显示（每 85 秒自动换码）。扫码成功并确认后，二维码面板自动收起、账户直接出现在表里。
 - **通知四选**：邮件（SMTP）、PushPlus、飞书 webhook、Telegram；口令写在加密的 `settings.enc.json` 里。
 - **零构建前端**：`web/` 只有 HTML + CSS + ES module，vendored tweetnacl，离线可用，Lighthouse a11y ≥ 90。
 
@@ -29,7 +29,7 @@ control.yml  手动/页面 ─┘                 accounts/ settings/ runs/ resp
 
 2. 本机 `python scripts/keygen.py` 生成密钥对，私钥存进 Secret `WXREAD_CONTROL_SK`；再跑一次 `control.yml`（`control = init`）并填入输出的 `public_key`。
 3. Settings → Pages → Source 选 **GitHub Actions**；打开部署好的页面，填仓库 / token / 状态密钥 → 连接。
-4. 点"生成二维码"→ 微信扫码；再导入一次 curl 补全 `appId/ps/pc`（扫码只给 cookie）。
+4. 点"扫码添加账户"→ 微信扫码；再导入一次 curl 补全 `appId/ps/pc`（扫码只给 cookie）。
 5. 点"立即运行"验证一次，之后交给定时任务。
 
 完整步骤、Secrets 清单、故障处置与上线验收清单见 **[docs/RUNBOOK.md](docs/RUNBOOK.md)**。

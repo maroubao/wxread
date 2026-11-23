@@ -70,6 +70,8 @@ async function connect() {
   state.cfg = { repo, token, branch };
   try {
     state.qrSession = sessionStorage.getItem("wxread.qrSession") || null;
+    const qrSecret = sessionStorage.getItem("wxread.qrReplyKey");
+    if (state.qrSession && qrSecret) state.sessions.set(state.qrSession, c.b64d(qrSecret));
   } catch (error) {
     state.qrSession = null;
   }
@@ -94,6 +96,12 @@ async function connect() {
     await refreshAll();
     const base = state.publicKey ? "已连接。" : "已连接，但还没有指令公钥：先跑一次 control.yml（control=init）。";
     say(base + expiryNote(), state.publicKey ? "ok" : "warn");
+    if (state.qrSession) {
+      // 刷新前正在扫码：把那一块放出来接着看，别让用户以为丢了
+      showQrPanel(true);
+      $("qr-hint").textContent = "接着上一次的扫码会话…";
+      pollQr().catch(() => {});
+    }
   } catch (error) {
     $("conn-dot").className = "dot bad";
     $("conn-text").textContent = "连接失败";
@@ -305,6 +313,11 @@ async function pollReceipt(sessionId, action, tries = 0) {
     const envelope = JSON.parse(new TextDecoder().decode(file.bytes));
     const receipt = c.unseal(envelope, state.sessions.get(sessionId));
     const ok = receipt.ok !== false;
+    if (action === "qr") {
+      // 二维码的收尾由 finishQr 统一做（收起面板、刷新账户表），这里不重复说话
+      finishQr(sessionId, receipt, ok);
+      return;
+    }
     say(`${action} ${ok ? "完成" : "失败"}：${JSON.stringify(receipt).slice(0, 400)}`, ok ? "ok" : "bad");
     await refreshAll();
   } catch (error) {
@@ -326,19 +339,75 @@ async function findSessionQr(sessionId) {
   return names.length ? `responses/${names[names.length - 1]}` : null;
 }
 
+function showQrPanel(live) {
+  $("qr-idle").hidden = live;
+  $("qr-live").hidden = !live;
+  if (live) {
+    $("qr-slot").innerHTML =
+      '<div class="empty">已申请，等待 control.yml 生成二维码…<br />首次要装浏览器依赖，通常 1–2 分钟。</div>';
+    $("qr-hint").textContent = "正在生成二维码…";
+  } else {
+    $("qr-slot").innerHTML = '<div class="empty">这一轮结束了。要加账户再点“扫码添加账户”。</div>';
+  }
+}
+
+function clearQrSession() {
+  const sessionId = state.qrSession;
+  state.qrSession = null;
+  try {
+    sessionStorage.removeItem("wxread.qrSession");
+    sessionStorage.removeItem("wxread.qrReplyKey");
+  } catch (error) {
+    // 隐私模式下 sessionStorage 不可用，忽略
+  }
+  return sessionId;
+}
+
+function finishQr(sessionId, receipt, ok) {
+  if (state.qrSession !== sessionId) return; // 已经收过尾了，重复回执不再刷屏
+  clearQrSession();
+  showQrPanel(false);
+  const who = (receipt && (receipt.label || receipt.account_id)) || "";
+  if (ok) {
+    say(`账户已绑定${who ? `：${who}` : ""}。二维码区已收起，接着去“导入 cURL”补 appId/ps/pc。`, "ok");
+  } else {
+    say(`扫码没有成功${receipt && receipt.error ? `：${receipt.error}` : ""}。要重试再点“扫码添加账户”。`, "bad");
+  }
+  refreshAll().catch(() => {});
+}
+
+async function qrReceipt(sessionId) {
+  // 回执 = 这一轮跑完了（成功或失败）。轮询它，扫码成功后立刻收尾，不用等 15 分钟预算烧完。
+  const file = await gh.getFile(state.cfg, `responses/${sessionId}.json`).catch(() => null);
+  if (!file) return null;
+  const secret = state.sessions.get(sessionId);
+  if (!secret) return {}; // 换过标签页、私钥丢了：只知道它结束了，解不开内容
+  try {
+    return c.unseal(JSON.parse(new TextDecoder().decode(file.bytes)), secret);
+  } catch (error) {
+    return {};
+  }
+}
+
 async function pollQr(startedAt = Date.now(), shownPath = null) {
-  const elapsed = Math.round((Date.now() - startedAt) / 1000);
+  if (!state.qrSession) return;
+  const sessionId = state.qrSession;
   if (Date.now() - startedAt > QR_BUDGET_MS) {
-    say("二维码轮询超时：去 Actions 看 control 运行，或改用本机 scripts/qr_local.py。", "warn");
+    clearQrSession();
+    showQrPanel(false);
+    say('这一轮扫码超时（15 分钟）：二维码区已收起，需要的话重新点“扫码添加账户”。', "warn");
     return;
   }
-  if (!state.qrSession) {
-    say('还没有扫码会话：先点"生成二维码"。', "warn");
+  const receipt = await qrReceipt(sessionId);
+  if (receipt) {
+    finishQr(sessionId, receipt, receipt.ok !== false);
     return;
   }
+  if (state.qrSession !== sessionId) return;
+  const elapsed = Math.round((Date.now() - startedAt) / 1000);
   let path = null;
   try {
-    path = await findSessionQr(state.qrSession);
+    path = await findSessionQr(sessionId);
   } catch (error) {
     // 网络抖动不算失败，下一轮再看
   }
@@ -349,26 +418,38 @@ async function pollQr(startedAt = Date.now(), shownPath = null) {
       $("qr-slot").innerHTML = `<img alt="微信读书登录二维码，用微信扫描" src="${url}" />`;
       shownPath = path;
       state.qrShots += 1;
+      $("qr-hint").textContent = `第 ${state.qrShots} 张码，已等 ${elapsed} 秒。用微信扫一扫；过期会自动换新码。`;
       say(`二维码已就绪（第 ${state.qrShots} 张，等了 ${elapsed} 秒），用微信扫一扫；过期会自动换新码。`, "ok");
     }
   } else if (!shownPath) {
     $("qr-slot").innerHTML =
       `<div class="empty">control.yml 启动中…（已等 ${elapsed} 秒）` +
       `<br />首次要装浏览器依赖，通常 1–2 分钟；码一出来就显示在这里。</div>`;
+    $("qr-hint").textContent = `正在生成二维码…（已等 ${elapsed} 秒）`;
   }
   setTimeout(() => pollQr(startedAt, shownPath).catch(() => {}), QR_POLL_MS);
 }
 
 async function askQr() {
+  if (state.qrSession) {
+    say("已经有一轮扫码在进行中：等它结束，或先点“取消”。", "warn");
+    showQrPanel(true);
+    return;
+  }
   state.qrShots = 0;
-  state.qrSession = null;
-  $("qr-slot").innerHTML = '<div class="empty">已申请，等待 control.yml 生成二维码…</div>';
+  showQrPanel(true);
   const sessionId = await sendInstruction("qr", { label: $("inp-qr-label").value.trim(), timeout: 600 });
+  if (!sessionId) {
+    showQrPanel(false);
+    return;
+  }
   state.qrSession = sessionId;
   try {
-    sessionStorage.setItem("wxread.qrSession", sessionId); // 刷新页面还能接着看这批帧
+    sessionStorage.setItem("wxread.qrSession", sessionId);
+    const secret = state.sessions.get(sessionId);
+    if (secret) sessionStorage.setItem("wxread.qrReplyKey", c.b64e(secret));
   } catch (error) {
-    // 隐私模式下 sessionStorage 可能不可用，忽略
+    // 隐私模式下 sessionStorage 不可用，忽略
   }
   pollQr().catch(() => {});
 }
@@ -442,6 +523,22 @@ function bind() {
   $("btn-refresh").addEventListener("click", () => refreshAll().catch((error) => say(error.message, "bad")));
   $("btn-qr").addEventListener("click", () => askQr().catch((error) => say(error.message, "bad")));
   $("btn-qr-poll").addEventListener("click", () => pollQr().catch(() => {}));
+  $("btn-qr-cancel").addEventListener("click", async () => {
+    const sessionId = clearQrSession();
+    showQrPanel(false);
+    say("已收起二维码区。", "ok");
+    if (!sessionId) return;
+    try {
+      const runs = await gh.listRuns(state.cfg, "control.yml");
+      const running = runs.find((run) => run.status === "in_progress" || run.status === "queued");
+      if (running) {
+        await gh.cancelRun(state.cfg, running.id);
+        say(`已请求取消 control 运行 #${running.run_number}。`, "ok");
+      }
+    } catch (error) {
+      say(`取消 control 运行失败（不影响已收起的界面）：${error.message}`, "warn");
+    }
+  });
 
   const runRead = () => {
     const inputs = {};

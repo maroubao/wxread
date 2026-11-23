@@ -78,22 +78,38 @@
       </section>
 
       <section aria-labelledby="qr-title">
-        <h2 id="qr-title">扫码登录</h2>
+        <h2 id="qr-title">扫码添加账户</h2>
         <div class="card">
-          <div class="qr">
-            <div id="qr-slot"><div class="empty">点下面的按钮申请二维码<br />二维码写入状态分支后在此显示</div></div>
-            <div>
+          <div id="qr-idle">
+            <div class="cols">
               <label class="field">
                 <span>账户备注（≤24 字）</span>
                 <input type="text" id="inp-qr-label" maxlength="24" placeholder="主号" />
               </label>
-              <div class="actions">
-                <button type="button" class="primary" id="btn-qr">生成二维码</button>
-                <button type="button" id="btn-qr-poll">刷新二维码</button>
+            </div>
+            <div class="actions">
+              <button type="button" class="primary" id="btn-qr">扫码添加账户</button>
+            </div>
+            <p class="sub" style="color: var(--text-3); font-size: var(--fs-xs); margin: var(--sp-3) 0 0">
+              只有点这个按钮才会出二维码。扫完并确认登录后这一块会自动收起，账户出现在下面的表里。
+            </p>
+          </div>
+
+          <div id="qr-live" hidden>
+            <div class="qr">
+              <div id="qr-slot">
+                <div class="empty">已申请，等待 control.yml 生成二维码…<br />首次要装浏览器依赖，通常 1–2 分钟。</div>
               </div>
-              <p class="sub" style="color: var(--text-3); font-size: var(--fs-xs); margin: var(--sp-3) 0 0">
-                扫码任务跑在 control.yml 里，约 10 分钟超时；二维码 2 分钟过期，点“刷新二维码”取最新一张。
-              </p>
+              <div>
+                <p class="sub" id="qr-hint" role="status" aria-live="polite">正在生成二维码…</p>
+                <div class="actions">
+                  <button type="button" id="btn-qr-poll">刷新二维码</button>
+                  <button type="button" id="btn-qr-cancel">取消</button>
+                </div>
+                <p class="sub" style="color: var(--text-3); font-size: var(--fs-xs); margin: var(--sp-3) 0 0">
+                  二维码约 2 分钟过期，过期后会自动换新码；扫码期间不要重复点“扫码添加账户”。
+                </p>
+              </div>
             </div>
           </div>
         </div>
