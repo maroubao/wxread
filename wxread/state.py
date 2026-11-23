@@ -187,7 +187,8 @@ class GitHubContents:
         if resp.status_code in (409, 412, 422):
             raise Conflict(f"写入 {path} 冲突：HTTP {resp.status_code}")
         if resp.status_code not in (200, 201):
-            raise StateWriteError(f"写入 {path} 失败：HTTP {resp.status_code}")
+            hint = "（分支不存在，或 token 没有 contents: write）" if resp.status_code == 404 else ""
+            raise StateWriteError(f"写入 {path} 失败：HTTP {resp.status_code}{hint}")
         return resp.json()["content"]["sha"]
 
     def delete(self, path: str, message: str, sha: str | None = None) -> None:
