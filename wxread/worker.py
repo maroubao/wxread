@@ -258,9 +258,38 @@ def cmd_warm(store: StateStore, env: Mapping[str, str], transport_factory=None, 
     return EXIT_OK if summary.failed == 0 else EXIT_ALL_FAILED
 
 
+def qr_frame_path(session: str, seq: int, fingerprint: str) -> str:
+    """二维码帧名带会话与序号：网页只挑本次会话的帧，历史帧（可能带过期浮层）永远不会被显示。"""
+    return f"responses/qr-{session}-{seq:03d}-{fingerprint}.png"
+
+
+def purge_stale_qr(store: StateStore, keep_session: str) -> int:
+    """删掉别的会话留下的二维码帧，避免状态分支越积越多、也避免旧帧被误当成新码。"""
+    try:
+        names = store.backend.list("responses")
+    except (StateError, NotImplementedError):
+        return 0
+    removed = 0
+    for name in names:
+        base = name.rsplit("/", 1)[-1]
+        if not (base.startswith("qr-") and base.endswith(".png")):
+            continue
+        if base.startswith(f"qr-{keep_session}-"):
+            continue
+        try:
+            store.backend.delete(f"responses/{base}", f"chore(state): drop stale qr {base}")
+            removed += 1
+        except StateError:
+            continue
+    return removed
+
+
 def cmd_control(store: StateStore, env: Mapping[str, str], *, qr_page_factory=None, notify_send=None, sleep=None) -> int:
     """`control.yml` 入口：init 建密钥对，或用密文指令执行管理动作。"""
     from . import control as control_mod
+
+    session = (_env(env, "WXREAD_SESSION") or "local").strip() or "local"
+    seq = {"n": 0}
 
     action = (_env(env, "WXREAD_CONTROL") or "instruction").strip().lower()
     qr_seconds = float(_env(env, "WXREAD_QR_SECONDS", str(control_mod.qr.DEFAULT_TIMEOUT)))
@@ -268,7 +297,8 @@ def cmd_control(store: StateStore, env: Mapping[str, str], *, qr_page_factory=No
     qr_dir = _env(env, "WXREAD_QR_DIR")
 
     def on_qr(shot) -> None:
-        path = f"responses/qr-{shot.fingerprint}.png"
+        seq["n"] += 1
+        path = qr_frame_path(session, seq["n"], shot.fingerprint)
         try:
             store.put_raw(path, shot.png, f"chore(state): qr {shot.fingerprint}")
             raw = f"{store.backend.repo}/blob/{store.backend.branch}/{path}"
@@ -320,6 +350,10 @@ def cmd_control(store: StateStore, env: Mapping[str, str], *, qr_page_factory=No
         instruction = control_mod.decode(envelope, secret_key)
     except (ValueError, CryptoFailure) as exc:
         raise ConfigError(f"指令无法解封：{scrub(str(exc))}") from exc
+    if getattr(instruction, "action", "") == "qr":
+        dropped = purge_stale_qr(store, session)
+        if dropped:
+            log.info("清掉 %d 张旧二维码帧", dropped)
     receipt = control_mod.execute(ctx, instruction, skew=int(_env(env, "WXREAD_SKEW", str(control_mod.DEFAULT_SKEW))))
     log.info("回执：%s", control_mod.summary(receipt))
     print(f"::notice::control {control_mod.summary(receipt)}", flush=True)

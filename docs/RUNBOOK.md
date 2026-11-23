@@ -125,8 +125,12 @@ python scripts/live_check.py
 ### 3.6 二维码不出现
 
 1. Actions 里看 `control` 运行：`playwright install` 失败 → CI 网络问题，重跑；
-2. 日志有 `::notice::qr updated ...` 但页面不显示 → 点"刷新二维码"（页面按 `responses` 路径的最近提交定位文件）；
+2. 日志有 `::notice::qr updated ...` 但页面不显示 → 点"刷新二维码"（页面只认本次会话的帧：
+   `responses/qr-<session_id>-<seq>-<指纹>.png`，序号保证按名字排序就是时间顺序）；
 3. 二维码出来了但扫码提示失效 → 点"刷新二维码"取最新一张（每 85 秒换码）。
+
+> 改了帧名规则之前留下的 `responses/qr-<指纹>.png` 会在下次点"生成二维码"时被
+> `worker.purge_stale_qr()` 删掉——那些是带方块浮层的旧图，不删就会继续被误当成新码。
 
 ### 3.7 二维码上出现一排方块 / 扫不出来
 
@@ -136,6 +140,9 @@ CI 的 headless Chrome 没装中文字体。二维码过期后微信读书会盖
 现在 `qr_png()` 优先读 `<img src="data:image/png;base64,...">` 的原始位图（干净、无文字、无浮层），
 只有取不到时才回落到截图。如果又看到方块，说明站点换了载体元素：把新的 selector 加进
 `wxread/qr.py` 的 `QR_SELECTORS`。
+
+**看到方块时先确认跑的是哪个提交**：workflow 用的是 dispatch 那一刻的 `main`，修复推送前点出去的
+那次运行会一直吐旧图，直到那次运行自己结束（最长 `qr_seconds`）。先 Cancel，再 Run workflow。
 
 ### 3.8 扫完码提示"登录失败，请重新扫码"
 

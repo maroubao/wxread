@@ -16,6 +16,7 @@ const state = {
   sessions: new Map(), // session_id -> 回执私钥
   pollTimer: null,
   qrShots: 0,
+  qrSession: null,
 };
 
 // 二维码轮询预算：control.yml 冷启动要装依赖、装浏览器，1–2 分钟才出第一张码；
@@ -66,6 +67,11 @@ async function connect() {
   }
   gh.saveConfig({ repo, token, branch });
   state.cfg = { repo, token, branch };
+  try {
+    state.qrSession = sessionStorage.getItem("wxread.qrSession") || null;
+  } catch (error) {
+    state.qrSession = null;
+  }
   if (keyText) {
     try {
       state.stateKey = c.stateKeyFromBase64(keyText);
@@ -307,14 +313,16 @@ async function pollReceipt(sessionId, action, tries = 0) {
 
 // ---------------------------------------------------------------- 二维码
 
-async function findLatestQr() {
-  // 二维码文件名里带指纹，指纹不按时间排序；用 responses 路径上最后一次提交的信息定位
-  const commit = await gh.latestCommitForPath(state.cfg, "responses");
-  const match = commit && /qr ([0-9a-f]{16})/.exec(commit.commit && commit.commit.message ? commit.commit.message : "");
-  if (match) return `responses/qr-${match[1]}.png`;
+async function findSessionQr(sessionId) {
+  // 帧名 = qr-<session>-<seq>-<fp>.png，序号保证按名字排序就是时间顺序。
+  // 只认本次会话的帧：上一轮留下的（可能带过期浮层的）旧图永远不会被显示。
   const dir = await gh.listDir(state.cfg, "responses");
-  const pngs = dir.filter((item) => item.name.endsWith(".png")).map((item) => item.name).sort();
-  return pngs.length ? `responses/${pngs[pngs.length - 1]}` : null;
+  const prefix = `qr-${sessionId}-`;
+  const names = dir
+    .filter((item) => item.name.startsWith(prefix) && item.name.endsWith(".png"))
+    .map((item) => item.name)
+    .sort();
+  return names.length ? `responses/${names[names.length - 1]}` : null;
 }
 
 async function pollQr(startedAt = Date.now(), shownPath = null) {
@@ -323,9 +331,13 @@ async function pollQr(startedAt = Date.now(), shownPath = null) {
     say("二维码轮询超时：去 Actions 看 control 运行，或改用本机 scripts/qr_local.py。", "warn");
     return;
   }
+  if (!state.qrSession) {
+    say('还没有扫码会话：先点"生成二维码"。', "warn");
+    return;
+  }
   let path = null;
   try {
-    path = await findLatestQr();
+    path = await findSessionQr(state.qrSession);
   } catch (error) {
     // 网络抖动不算失败，下一轮再看
   }
@@ -348,8 +360,15 @@ async function pollQr(startedAt = Date.now(), shownPath = null) {
 
 async function askQr() {
   state.qrShots = 0;
+  state.qrSession = null;
   $("qr-slot").innerHTML = '<div class="empty">已申请，等待 control.yml 生成二维码…</div>';
-  await sendInstruction("qr", { label: $("inp-qr-label").value.trim(), timeout: 600 });
+  const sessionId = await sendInstruction("qr", { label: $("inp-qr-label").value.trim(), timeout: 600 });
+  state.qrSession = sessionId;
+  try {
+    sessionStorage.setItem("wxread.qrSession", sessionId); // 刷新页面还能接着看这批帧
+  } catch (error) {
+    // 隐私模式下 sessionStorage 可能不可用，忽略
+  }
   pollQr().catch(() => {});
 }
 
