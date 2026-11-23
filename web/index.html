@@ -116,7 +116,7 @@
       </section>
 
       <section aria-labelledby="curl-title">
-        <h2 id="curl-title">导入 cURL</h2>
+        <h2 id="curl-title">导入 cURL（只在自动抓取失败时用）</h2>
         <div class="card">
           <label class="field">
             <span>在 weread.qq.com 里随便读一本书，F12 → Network 过滤 <code>read</code> → 右键那条请求 → Copy as cURL，整段贴进来</span>
@@ -136,7 +136,8 @@
             <button type="button" class="primary" id="btn-import">导入 / 更新 payload</button>
           </div>
           <p class="sub" style="color: var(--text-3); font-size: var(--fs-xs); margin: var(--sp-3) 0 0">
-            扫码只拿到 cookie，<code>appId / ps / pc</code> 要由这条 curl 提供；同一个 <code>wr_vid</code>
+            扫码时已经让浏览器自己打开书架读一段，<code>appId / ps / pc</code> 会自动取回；只有那一趟没抓到
+            （书架空、那本书是付费或加载超时）才需要在这里补一次。同一个 <code>wr_vid</code>
             会合并到已绑定的那个账户，不用重新扫码。
           </p>
         </div>

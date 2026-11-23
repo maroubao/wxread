@@ -110,7 +110,8 @@ main.py:250-260 ──▶ run() main.py:199-247
 | `wxread/reader.py` | 单账户客户端：renewal、read、`Set-Cookie` 合并回调、L0–L3 判定 | 不写状态分支、不决定流程顺序 |
 | `wxread/jobs.py` | 串行队列、进度事件、取消、单账户 deadline | 不做重试策略（在 reader） |
 | `wxread/worker.py` | 子命令 `read` / `warm` / `migrate`；读 env、组装依赖、finally 落盘、决定退出码 | 不含协议细节 |
-| `wxread/qr.py` | 复用 runner 自带 Chrome 打开登录页、截图二维码、指纹去重 | 不解析 cookie（交给 control 流程落盘） |
+| `wxread/qr.py` | 复用 runner 自带 Chrome 打开登录页、截图二维码、指纹去重；登录后让浏览器读一段书并抓 `web/book/read` | 不解析 cookie（交给 control 流程落盘） |
+| `wxread/capture.py` | 从浏览器发出的请求里挑出 `web/book/read`，解析成账户的 `read_payload` | 不启动浏览器、不发请求 |
 | `wxread/warm.py` | 只跑 renewal + 写回，连续 2 次 L3 才通知 | 不阅读 |
 | `wxread/notify.py` | 邮件 / PushPlus / 飞书 / Telegram；失败重试有上限 | 不含其它渠道 |
 | `web/` | 控制台（12 个组件，见 DESIGN §5） | 不内联令牌、不引构建 |
@@ -259,7 +260,7 @@ main.py:250-260 ──▶ run() main.py:199-247
 ## 7. 目录规划（P1 之后落地）
 
 ```
-wxread/                 crypto.py  state.py  accounts.py  reader.py  jobs.py  worker.py  qr.py  warm.py  notify.py
+wxread/                 crypto.py  state.py  accounts.py  reader.py  jobs.py  worker.py  qr.py  capture.py  warm.py  notify.py
 web/                    index.html  assets/app.js  assets/components.js  assets/style.css
 docs/                   ARCHITECTURE.md  THREAT-MODEL.md  DESIGN.md  REVIEW.md  PLAN.md  RUNBOOK.md( P6 )
 docs/design/            tokens.css  variant-steel.html  final-A-1280.png  final-A-390.png  README.md

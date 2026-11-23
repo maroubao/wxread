@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping
@@ -19,6 +20,8 @@ from .accounts import Account, account_from_curl, clamp_target_count
 from .crypto import CryptoFailure, b64d, b64e, seal, unseal
 from .logsafe import scrub
 from .state import StateError, StateStore, utcnow_iso
+
+log = logging.getLogger(__name__)
 
 ACTIONS = (
     "init",
@@ -169,24 +172,54 @@ def handle_qr(ctx: ControlContext, payload: Mapping[str, Any]) -> dict:
             return {"ok": False, "reason": result.reason, "qr_count": len(result.shots)}
         cookies = page.cookies()
         payload_defaults = dict(payload.get("read_payload") or {})
+        captured, capture_headers = _capture_read_payload(page)
+        read_payload = dict(payload_defaults)
+        read_payload.update({k: v for k, v in captured.items() if v})
+        headers = {"User-Agent": page.user_agent()}
+        headers.update(capture_headers)
         account = qr.account_from_cookies(
             cookies,
-            headers={"User-Agent": page.user_agent()},
+            headers=headers,
             label=str(payload.get("label") or "")[:24],
             target_count=clamp_target_count(payload.get("target_count")),
-            payload=payload_defaults,
+            payload=read_payload,
             now_iso=ctx.now_iso(),
         )
         account.mark_renewed(cookies.get("wr_skey", ""), ctx.now_iso())
         existing = ctx.store.load_account(account.id)
         if existing:
             merged = _merge_accounts(existing, account)
+            # 上次扫码留下的"缺 ps/pc"提示，这次抓到参数就该撤掉
+            if merged.read_payload.get("ps") and merged.read_payload.get("pc") and merged.note == qr.PAYLOAD_HINT:
+                merged.note = ""
             ctx.store.save_account(merged.to_dict(), message="control: qr rebind")
         else:
             ctx.store.save_account(account.to_dict(), message="control: qr bind")
-        return {"ok": True, "account_id": account.id, "label": account.label, "rebound": bool(existing)}
+        return {
+            "ok": True,
+            "account_id": account.id,
+            "label": account.label,
+            "rebound": bool(existing),
+            "payload_captured": bool(captured),
+        }
     finally:
         page.close()
+
+
+def _capture_read_payload(page: Any) -> tuple[dict[str, str], dict[str, str]]:
+    """登录态下顺手把 `web/book/read` 的参数抓回来（抓不到就算了，不打断扫码）。"""
+    capture = getattr(page, "capture_read_payload", None)
+    if not callable(capture):
+        return {}, {}
+    try:
+        captured, headers = capture()
+    except Exception as exc:  # noqa: BLE001 - 抓包失败只能退回手工补
+        log.warning("自动抓取阅读参数失败：%s", exc)
+        return {}, {}
+    if not captured:
+        log.warning("自动抓取阅读参数失败：页面没有发出 web/book/read")
+        return {}, {}
+    return dict(captured), dict(headers or {})
 
 
 def _merge_accounts(

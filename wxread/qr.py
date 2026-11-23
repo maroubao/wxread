@@ -16,9 +16,10 @@ import base64
 import hashlib
 import time
 from dataclasses import dataclass, field
-from typing import Callable, Mapping, Protocol
+from typing import Any, Callable, Mapping, Protocol
 
 from .accounts import Account, derive_account_id
+from .capture import BOOK_LINK_SELECTORS, SHELF_URL, ReadSniffer
 from .logsafe import mask
 
 LOGIN_URL = "https://weread.qq.com/"
@@ -235,6 +236,75 @@ class ChromeLoginPage:
         assert self._page is not None
         jar = self._page.context.cookies()
         return {item["name"]: item["value"] for item in jar if item.get("name")}
+
+    def capture_read_payload(self, timeout: float = 90.0) -> tuple[dict[str, str], dict[str, str]]:
+        """登录态下打开一本书，抓站点自己发的 `web/book/read`，返回 (read_payload, headers)。
+
+        抓不到就返回 ({}, {})，由调用方退回"提醒用户导入 curl"的旧路径。
+        """
+        assert self._page is not None
+        sniffer = ReadSniffer()
+
+        def on_request(request: Any) -> None:
+            try:
+                sniffer.feed(
+                    getattr(request, "url", ""),
+                    getattr(request, "method", ""),
+                    request.post_data,
+                    getattr(request, "headers", None),
+                )
+            except Exception:  # 抓包不能影响主流程
+                pass
+
+        self._page.on("request", on_request)
+        try:
+            self._page.goto(SHELF_URL, wait_until="domcontentloaded", timeout=45_000)
+            self._page.wait_for_timeout(1500)
+            self._open_first_book()
+            deadline = time.monotonic() + max(5.0, timeout)
+            while not sniffer.ready and time.monotonic() < deadline:
+                self._page.wait_for_timeout(2000)
+                self._nudge_reader()
+            if not sniffer.ready:
+                return {}, {}
+            return sniffer.read_payload, sniffer.headers
+        except Exception:
+            return {}, {}
+        finally:
+            try:
+                self._page.remove_listener("request", on_request)
+            except Exception:
+                pass
+
+    def _open_first_book(self) -> bool:
+        """书架第一本书点进去；书架为空或还没渲染完就放弃。"""
+        assert self._page is not None
+        for selector in BOOK_LINK_SELECTORS:
+            try:
+                link = self._page.query_selector(selector)
+            except Exception:
+                link = None
+            if not link:
+                continue
+            try:
+                link.click(timeout=6000)
+                self._page.wait_for_timeout(2500)
+                return True
+            except Exception:
+                continue
+        return False
+
+    def _nudge_reader(self) -> None:
+        """正文页每 60 秒才发一次心跳；翻页会立刻触发，用它把时间压到几秒。"""
+        assert self._page is not None
+        for action in (
+            lambda: self._page.mouse.wheel(0, 900),
+            lambda: self._page.keyboard.press("PageDown"),
+        ):
+            try:
+                action()
+            except Exception:
+                pass
 
     def user_agent(self) -> str:
         return self._ua

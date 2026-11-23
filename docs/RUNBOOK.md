@@ -50,14 +50,17 @@ warm.yml  (每 6 小时)       --> worker warm  --> 只更新 accounts/*.enc.jso
 
    `public_key` 写到状态分支 `control.json`（明文，公钥本就该公开）。换钥就再跑一次并填新公钥，旧私钥立即失效（日志会提示 `公钥已替换`）。
 
-5. **绑定第一个账户**（二选一）：
+5. **绑定第一个账户**（扫码就行，通常不用碰 cURL）：
 
    - **扫码**：打开 Pages 站点 → 填仓库、token、状态密钥 → 点"连接并保存" → "扫码添加账户" → 微信扫。
-     扫完并确认登录后面板自动收起，账户出现在下表。
-   - **导入 curl**：浏览器 F12 → Network → 复制 `web/book/read` 请求为 cURL → 控制台"导入 cURL"贴进去点导入
-     （或本机 `scripts/control_local.py import --curl-file curl.txt`，见下）。
+     扫完并确认登录后，worker 会在同一个浏览器里打开书架读一段，把站点自己发的
+     `web/book/read` 请求抓下来，`appId/ps/pc` 一并写进账户；面板自动收起，账户出现在下表。
+   - **导入 curl**（只在自动抓取没成功时用）：浏览器 F12 → Network → 复制 `web/book/read` 请求为 cURL →
+     控制台"导入 cURL"贴进去点导入（或本机 `scripts/control_local.py import --curl-file curl.txt`，见下）。
 
-   扫码拿到的账户只有 cookie，缺 `appId/ps/pc`（**必须**再导入一次 curl 才有阅读参数），控制台会把 `note` 标成"扫码账户未带 ps/pc"。
+   自动抓取失败一律有回音：回执里 `payload_captured=false`，页面提示"这次没抓到阅读参数"，
+   账户 `note` 标成"扫码账户未带 ps/pc"，这时才需要补一次 curl。常见原因是书架为空、
+   打开的那本是付费书、或书架 90 秒内没渲染出来。
 
    导入用 `scripts/control_local.py`（终端下发密文指令，与网页按钮等价）：
 
@@ -76,7 +79,7 @@ warm.yml  (每 6 小时)       --> worker warm  --> 只更新 accounts/*.enc.jso
 | 想做什么 | 怎么做 |
 | --- | --- |
 | 改每日目标次数 | 控制台账户行"编辑" → `update` 指令 |
-| 补 `appId/ps/pc`（扫码后必做） | 控制台"导入 cURL"：F12 里复制一条 `read` 请求整段贴进去 → 点"导入 / 更新 payload"。同一个 `wr_vid` 合并到已绑账户，不用重新扫码 |
+| 补 `appId/ps/pc`（自动抓取失败时才做） | 控制台"导入 cURL"：F12 里复制一条 `read` 请求整段贴进去 → 点"导入 / 更新 payload"。同一个 `wr_vid` 合并到已绑账户，不用重新扫码 |
 | 临时补读 | 控制台"最近运行"填间隔/截止 → "按上面的参数试读"（`read.yml`，页面里能看到排队中/进行中/成功并给出日志链接） |
 | 只保活一次 | 控制台"保活一次"（`warm.yml`） |
 | 关掉自动运行 | 控制台"计划"取消勾选，或直接 `schedule` 指令 `enabled: false`（cron 仍在，但 worker 开头就退出 0） |
@@ -174,7 +177,7 @@ CI 的 headless Chrome 没装中文字体。二维码过期后微信读书会盖
 | 1 | `control.yml` `init` | 日志出现 `public_key`；状态分支出现 `control.json` |
 | 2 | 控制台连接 | 头部 chip 变"已连接"，账户区显示空状态而不是报错 |
 | 3 | 扫码（真实微信） | 账户出现且 `status=ok`；`renewed_at` 有值 |
-| 4 | 导入 curl | 同账户 `read_payload` 补齐 `appId/ps/pc/ci/co`，`note` 清空（`scripts/control_local.py import`） |
+| 4 | 阅读参数（应自动完成） | 扫码回执 `payload_captured=true`，账户 `read_payload` 里有 `appId/ps/pc` 且 `note` 为空；为 `false` 时用 `scripts/control_local.py import` 补一次 |
 | 5 | 手动 `read.yml`（`pace=3`，`target_count=3`） | `runs/` 出现记录，`read_count=3`，`succ` 分布在日志里，退出码 0 |
 | 6 | 每日定时 | 次日 01:07 后 `runs/` 有当天记录 |
 | 7 | `warm.yml` 手动 | 账户 `renewed_at` 前移，`wr_skey` 变化（8 位短码可能不变，看 `renewed_at`） |

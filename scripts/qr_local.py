@@ -45,14 +45,20 @@ def main() -> int:
         if not result.ok:
             return 1
         cookies = page.cookies()
+        print("[qr] 打开书架抓阅读参数（最多 90 秒）…", flush=True)
+        captured, capture_headers = page.capture_read_payload()
+        headers = {"User-Agent": page.user_agent()}
+        headers.update(capture_headers)
         payload = {
             "cookies": cookies,
-            "headers": {"User-Agent": page.user_agent()},
+            "headers": headers,
+            "read_payload": captured,
             "label": args.label,
             "at": utcnow_iso(),
         }
         pathlib.Path(args.cookies_out).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"[qr] cookie 已写 {args.cookies_out}（wr_vid={cookies.get('wr_vid')}, wr_skey 长度={len(cookies.get('wr_skey',''))}）")
+        print(f"[qr] read_payload 字段：{sorted(captured) or '（没抓到，需要导入一次 curl）'}")
         return 0
     finally:
         page.close()

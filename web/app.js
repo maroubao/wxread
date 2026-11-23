@@ -369,7 +369,11 @@ function finishQr(sessionId, receipt, ok) {
   showQrPanel(false);
   const who = (receipt && (receipt.label || receipt.account_id)) || "";
   if (ok) {
-    say(`账户已绑定${who ? `：${who}` : ""}。二维码区已收起，接着去“导入 cURL”补 appId/ps/pc。`, "ok");
+    const captured = receipt && receipt.payload_captured;
+    const tail = captured
+      ? "阅读参数已自动从浏览器里取到，可以直接“按上面的参数试读”。"
+      : "这次没抓到阅读参数（书架没打开成功或那本书没正文），去“导入 cURL”补一次 appId/ps/pc 也能跑。";
+    say(`账户已绑定${who ? `：${who}` : ""}。二维码区已收起。${tail}`, "ok");
   } else {
     say(`扫码没有成功${receipt && receipt.error ? `：${receipt.error}` : ""}。要重试再点“扫码添加账户”。`, "bad");
   }
