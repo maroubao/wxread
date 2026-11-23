@@ -27,6 +27,7 @@ log = logging.getLogger(__name__)
 ACTIONS = (
     "init",
     "qr",
+    "capture",
     "import",
     "update",
     "delete",
@@ -231,6 +232,41 @@ def _capture_read_payload(page: Any) -> tuple[dict[str, Any], dict[str, str]]:
     return dict(captured), dict(headers or {})
 
 
+def handle_capture(ctx: ControlContext, payload: Mapping[str, Any]) -> dict:
+    """使用已保存的登录态自动重新获取阅读参数。"""
+    account_id = str(payload.get("account_id") or "")
+    existing = ctx.store.load_account(account_id)
+    if existing is None:
+        raise ControlError("账户不存在")
+    account = Account.from_dict(existing)
+    factory = ctx.qr_page_factory or (lambda: qr.ChromeLoginPage(initial_cookies=account.cookies))
+    page = factory()
+    try:
+        page.open()
+        captured, headers = _capture_read_payload(page)
+        if not captured:
+            return {"ok": False, "account_id": account_id, "error": getattr(page, "capture_error", "") or "自动获取失败，可以重试", "reason": "capture_failed"}
+        cookies = page.cookies()
+        account.read_payload.update(captured)
+        account.headers.update({"User-Agent": page.user_agent(), **headers})
+        account.cookies.update(cookies)
+        account.mark_ok(ctx.now_iso())
+        account.mark_renewed(account.cookies.get("wr_skey", ""), ctx.now_iso())
+
+        def merge(current: dict | None) -> dict:
+            if current is None:
+                raise ControlError("账户已删除")
+            merged = _merge_accounts(current, account)
+            merged.note = ""
+            merged.last_ok_at = account.last_ok_at
+            return merged.to_dict()
+
+        ctx.store.mutate_account(account_id, merge, "control: capture read payload")
+        return {"ok": True, "account_id": account_id, "payload_captured": True, "label": account.label}
+    finally:
+        page.close()
+
+
 def _merge_accounts(
     existing: Mapping[str, Any],
     fresh: Account,
@@ -386,6 +422,7 @@ def handle_test(ctx: ControlContext, payload: Mapping[str, Any], *, kind: str) -
 _HANDLERS: dict[str, Callable[[ControlContext, Mapping[str, Any]], dict]] = {
     "init": handle_init,
     "qr": handle_qr,
+    "capture": handle_capture,
     "import": handle_import,
     "update": handle_update,
     "delete": handle_delete,

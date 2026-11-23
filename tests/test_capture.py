@@ -57,7 +57,7 @@ def test_sniffer_takes_the_first_qualified_read_request():
 
 def test_sniffer_promotes_only_account_fields_and_drops_transport_headers():
     sniffer = capture.ReadSniffer()
-    sniffer.feed("https://weread.qq.com/web/book/readingProgress", "POST", READ_BODY, BROWSER_HEADERS)
+    sniffer.feed("https://weread.qq.com/web/book/read", "POST", READ_BODY, BROWSER_HEADERS)
     payload = sniffer.read_payload
     assert set(payload) == {"appId", "ps", "pc", "ci", "co", "sm", "pr", "b", "c"}
     assert payload["ci"] == 27 and payload["co"] == 389 and payload["pr"] == 74
@@ -66,8 +66,10 @@ def test_sniffer_promotes_only_account_fields_and_drops_transport_headers():
     headers = sniffer.headers
     assert headers["User-Agent"] == "Mozilla/5.0 Chrome/141"
     assert headers["accept"] == "application/json"
-    for dropped in ("Cookie", "Content-Type", "Origin", "Referer"):
+    for dropped in ("Cookie", "Content-Type"):
         assert dropped not in headers
+    assert headers["Origin"] == "https://weread.qq.com"
+    assert headers["Referer"] == BROWSER_HEADERS["Referer"]
 
 
 class QrOnlyPage:
@@ -132,7 +134,7 @@ def test_qr_without_capture_still_binds_and_flags_the_gap(store: StateStore):
     assert receipt["payload_captured"] is False
     stored = store.load_account(receipt["account_id"])
     assert stored["read_payload"] == {}
-    assert "ps/pc" in stored["note"]
+    assert "自动获取" in stored["note"]
 
 
 def test_capture_failure_does_not_break_the_binding(store: StateStore):
@@ -143,7 +145,7 @@ def test_capture_failure_does_not_break_the_binding(store: StateStore):
 
 def test_rebind_clears_the_stale_missing_payload_note(store: StateStore):
     first = control.handle_qr(make_ctx(store, QrOnlyPage()), {})
-    assert "ps/pc" in store.load_account(first["account_id"])["note"]
+    assert "自动获取" in store.load_account(first["account_id"])["note"]
 
     again = control.handle_qr(make_ctx(store, CapturingPage()), {})
     assert again["account_id"] == first["account_id"]
@@ -188,3 +190,18 @@ def test_incomplete_qr_account_can_be_renamed_and_disabled(store: StateStore):
     control.handle_update(ctx, {"account_id": receipt["account_id"], "label": "稍后补全", "enabled": False})
     saved = store.load_account(receipt["account_id"])
     assert saved["label"] == "稍后补全" and saved["enabled"] is False
+
+
+def test_read_capture_requires_a_successful_matching_response():
+    sniffer = capture.ReadSniffer()
+    sniffer.feed("https://weread.qq.com/web/book/read", "POST", READ_BODY, BROWSER_HEADERS)
+    assert sniffer.confirmed is False
+    assert sniffer.confirm_response("https://weread.qq.com/web/book/read", "POST", READ_BODY, BROWSER_HEADERS, {"succ": 0}) is False
+    assert sniffer.confirm_response("https://weread.qq.com/web/book/read", "POST", READ_BODY, BROWSER_HEADERS, {"succ": 1, "synckey": "valid"}) is True
+    assert sniffer.confirmed is True
+
+
+def test_progress_or_other_hosts_are_not_read_payload_proof():
+    sniffer = capture.ReadSniffer()
+    assert sniffer.feed("https://weread.qq.com/web/book/readingProgress", "POST", READ_BODY) is False
+    assert sniffer.feed("https://other.example/web/book/read", "POST", READ_BODY) is False

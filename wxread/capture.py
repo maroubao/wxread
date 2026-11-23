@@ -14,13 +14,14 @@ from __future__ import annotations
 import json
 import logging
 from typing import Any, Mapping
+from urllib.parse import urlparse
 
 from .accounts import PROMOTED_PAYLOAD_FIELDS, REQUIRED_PAYLOAD_FIELDS, normalize_read_payload
 
 log = logging.getLogger(__name__)
 
 # 站点读正文时发的那几条：主心跳是 web/book/read，进度上报是 readingProgress
-READ_PATH_HINTS = ("/web/book/read", "/web/book/readingProgress")
+READ_PATH_HINTS = ("/web/book/read",)
 
 # 这些头由 transport 自己决定，抄进账户反而会让请求变形
 DROP_HEADERS = frozenset(
@@ -31,8 +32,6 @@ DROP_HEADERS = frozenset(
         "connection",
         "accept-encoding",
         "content-type",
-        "origin",
-        "referer",
         "sec-fetch-dest",
         "sec-fetch-mode",
         "sec-fetch-site",
@@ -40,7 +39,7 @@ DROP_HEADERS = frozenset(
 )
 
 SHELF_URL = "https://weread.qq.com/web/shelf"
-BOOK_LINK_SELECTORS = ("a[href*='/web/book/']", ".shelfBook", ".bookItem")
+BOOK_LINK_SELECTORS = ("a[href*='/web/reader/']", "a[href*='/web/book/']", ".shelfBook", ".bookItem")
 
 
 def parse_read_body(body: str | None) -> dict[str, Any] | None:
@@ -85,6 +84,7 @@ class ReadSniffer:
     def __init__(self) -> None:
         self._payload: dict[str, Any] = {}
         self._headers: dict[str, str] = {}
+        self.confirmed = False
         self.seen = 0
 
     def feed(self, url: str, method: str, body: str | None, headers: Mapping[str, str] | None = None) -> bool:
@@ -93,7 +93,8 @@ class ReadSniffer:
             return True
         if (method or "").upper() != "POST":
             return False
-        if not any(hint in (url or "") for hint in READ_PATH_HINTS):
+        parsed_url = urlparse(url or "")
+        if parsed_url.hostname != "weread.qq.com" or parsed_url.path not in READ_PATH_HINTS:
             return False
         parsed = parse_read_body(body)
         if not parsed:
@@ -102,6 +103,23 @@ class ReadSniffer:
         self._payload = parsed
         self._headers = accepted_headers(headers)
         log.info("抓到阅读参数：%d 个字段", len(parsed))
+        return True
+
+    def confirm_response(self, url: str, method: str, body: str | None, headers: Mapping[str, str] | None, response: Mapping[str, Any]) -> bool:
+        """仅保存获得succ/synckey确认的同一条阅读请求。"""
+        if self.confirmed:
+            return True
+        parsed_url = urlparse(url or "")
+        if method != "POST" or parsed_url.hostname != "weread.qq.com" or parsed_url.path not in READ_PATH_HINTS:
+            return False
+        payload = parse_read_body(body)
+        if not payload or not payload.get("b") or not payload.get("c"):
+            return False
+        if response.get("succ") != 1 or not response.get("synckey"):
+            return False
+        self._payload = payload
+        self._headers = accepted_headers(headers)
+        self.confirmed = True
         return True
 
     @property
