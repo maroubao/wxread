@@ -11,12 +11,13 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping
 
 from . import notify, qr
-from .accounts import Account, account_from_curl, clamp_target_count, normalize_read_payload
+from .accounts import Account, MissingFieldsError, account_from_curl, clamp_target_count, normalize_read_payload
 from .crypto import CryptoFailure, b64d, b64e, seal, unseal
 from .logsafe import scrub
 from .state import StateError, StateStore, utcnow_iso
@@ -59,6 +60,8 @@ class Instruction:
         session_id = str(data.get("session_id") or "")
         if not action or not session_id:
             raise ControlError("指令缺少 action/session_id")
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", session_id):
+            raise ControlError("session_id 只能包含字母、数字、下划线与短横线")
         try:
             issued_at = int(data.get("issued_at") or 0)
         except (TypeError, ValueError) as exc:
@@ -106,6 +109,7 @@ class ControlContext:
     qr_page_factory: Callable[[], qr.LoginPage] | None = None
     qr_timeout: float = qr.DEFAULT_TIMEOUT
     qr_out: Callable[[qr.QrShot], None] | None = None
+    qr_progress: Callable[[dict], None] | None = None
     notify_send: Callable[..., list] | None = None
 
 
@@ -170,6 +174,8 @@ def handle_qr(ctx: ControlContext, payload: Mapping[str, Any]) -> dict:
         )
         if not result.ok:
             return {"ok": False, "reason": result.reason, "qr_count": len(result.shots)}
+        if ctx.qr_progress:
+            ctx.qr_progress({"stage": "capturing", "message": "登录已确认，正在获取阅读参数"})
         cookies = page.cookies()
         payload_defaults = dict(payload.get("read_payload") or {})
         captured, capture_headers = _capture_read_payload(page)
@@ -390,6 +396,16 @@ _HANDLERS: dict[str, Callable[[ControlContext, Mapping[str, Any]], dict]] = {
 }
 
 
+def _write_receipt(ctx: ControlContext, instruction: Instruction, receipt: Mapping[str, Any]) -> None:
+    envelope: dict = {"v": 0, "plain": dict(receipt)}
+    if instruction.reply_key:
+        try:
+            envelope = seal(receipt, b64d(instruction.reply_key))
+        except CryptoFailure as exc:
+            raise ControlError("回执公钥无效") from exc
+    ctx.store.write_response(instruction.session_id, envelope)
+
+
 def execute(
     ctx: ControlContext,
     instruction: Instruction,
@@ -397,34 +413,40 @@ def execute(
     now: int | None = None,
     skew: int = DEFAULT_SKEW,
 ) -> dict:
-    """校验 → 抢 session → 执行 → 写回执。返回回执明文（测试用），同时加密落盘。"""
-    check_action(instruction)
-    check_fresh(instruction, now=now, skew=skew)
-    try:
-        ctx.store.claim_session(
-            instruction.session_id,
-            {"action": instruction.action, "issued_at": instruction.issued_at, "claimed_at": ctx.now_iso()},
-        )
-    except StateError as exc:
-        raise ControlError(f"session 已被消费（重放防护）：{scrub(str(exc))}") from exc
-
+    """校验、消费会话、执行并写加密回执，拒绝的指令也产生失败回执。"""
     receipt: dict = {"ok": False, "action": instruction.action, "session_id": instruction.session_id, "at": ctx.now_iso()}
+    try:
+        check_action(instruction)
+        check_fresh(instruction, now=now, skew=skew)
+        try:
+            ctx.store.claim_session(
+                instruction.session_id,
+                {"action": instruction.action, "issued_at": instruction.issued_at, "claimed_at": ctx.now_iso()},
+            )
+        except StateError as exc:
+            raise ControlError(f"session 已被消费（重放防护）：{scrub(str(exc))}") from exc
+    except ControlError as exc:
+        receipt["error"] = scrub(str(exc))
+        if ctx.store.read_response(instruction.session_id) is None:
+            _write_receipt(ctx, instruction, receipt)
+        raise
+
+    previous_progress = ctx.qr_progress
+    if instruction.action == "qr":
+        ctx.qr_progress = lambda progress: _write_receipt(ctx, instruction, {**receipt, **progress, "pending": True})
     try:
         result = _HANDLERS[instruction.action](ctx, instruction.payload)
         receipt.update(result)
         receipt["ok"] = bool(result.get("ok", True))
+    except MissingFieldsError as exc:
+        receipt.update({"ok": False, "error": str(exc), "missing_fields": exc.fields})
     except ControlError as exc:
-        receipt.update({"ok": False, "error": str(exc)})
-    except Exception as exc:  # 任何未预期异常都必须变成回执，否则页面会一直等
+        receipt.update({"ok": False, "error": scrub(str(exc))})
+    except Exception as exc:
         receipt.update({"ok": False, "error": f"{type(exc).__name__}: {scrub(str(exc))}"})
-    envelope: dict = {"v": 0, "plain": receipt}
-    if instruction.reply_key:
-        try:
-            envelope = seal(receipt, b64d(instruction.reply_key))
-        except CryptoFailure as exc:
-            receipt["reply_error"] = str(exc)
-            envelope = {"v": 0, "plain": receipt}
-    ctx.store.write_response(instruction.session_id, envelope)
+    finally:
+        ctx.qr_progress = previous_progress
+    _write_receipt(ctx, instruction, receipt)
     return receipt
 
 

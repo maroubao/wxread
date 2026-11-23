@@ -348,13 +348,28 @@ def cmd_control(store: StateStore, env: Mapping[str, str], *, qr_page_factory=No
         envelope = json.loads(instruction_text)
         secret_key = b64d(secret_text)
         instruction = control_mod.decode(envelope, secret_key)
-    except (ValueError, CryptoFailure) as exc:
+    except (ValueError, CryptoFailure, control_mod.ControlError) as exc:
         raise ConfigError(f"指令无法解封：{scrub(str(exc))}") from exc
+    if _env(env, "WXREAD_SESSION") and session != instruction.session_id:
+        raise ConfigError("workflow 的 session_id 与密文指令不一致")
+    session = instruction.session_id
+    try:
+        if len(b64d(instruction.reply_key)) != 32:
+            raise ConfigError("指令需要32字节回执公钥")
+    except CryptoFailure as exc:
+        raise ConfigError("指令回执公钥无效") from exc
     if getattr(instruction, "action", "") == "qr":
         dropped = purge_stale_qr(store, session)
         if dropped:
             log.info("清掉 %d 张旧二维码帧", dropped)
-    receipt = control_mod.execute(ctx, instruction, skew=int(_env(env, "WXREAD_SKEW", str(control_mod.DEFAULT_SKEW))))
+    received_at = store.backend.run_created_at(str(env["GITHUB_RUN_ID"])) if env.get("GITHUB_RUN_ID") else None
+    try:
+        receipt = control_mod.execute(
+            ctx, instruction, now=received_at, skew=int(_env(env, "WXREAD_SKEW", str(control_mod.DEFAULT_SKEW)))
+        )
+    except control_mod.ControlError as exc:
+        log.warning("指令被拒绝：%s", scrub(str(exc)))
+        return EXIT_ALL_FAILED
     log.info("回执：%s", control_mod.summary(receipt))
     print(f"::notice::control {control_mod.summary(receipt)}", flush=True)
     return EXIT_OK if receipt.get("ok") else EXIT_ALL_FAILED

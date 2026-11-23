@@ -35,6 +35,7 @@ concurrency:
 
 permissions:
   contents: write # 状态分支由 Contents API 写入，需要写权限
+  actions: read # 读取本次run的created_at，以接收时刻校验指令，排队不消耗有效期
 
 jobs:
   control:

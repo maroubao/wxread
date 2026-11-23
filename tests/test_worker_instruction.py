@@ -75,3 +75,40 @@ def test_instruction_needs_both_env_values(store: StateStore):
 
     with pytest.raises(Exception, match="instruction"):
         cmd_control(store, {"WXREAD_CONTROL": "instruction"})
+
+
+def test_queued_instruction_uses_github_run_creation_time(store, monkeypatch):
+    from wxread import control
+
+    public, secret = seed_control_key(store)
+    env, _session, _reply = make_instruction("schedule", {"daily": "02:30"}, public, secret)
+    received_at = int(time.time())
+    env["GITHUB_RUN_ID"] = "123"
+    monkeypatch.setattr(store.backend, "run_created_at", lambda _run: received_at, raising=False)
+    monkeypatch.setattr(control.time, "time", lambda: received_at + 180)
+    assert cmd_control(store, env) == 0
+    assert store.load_settings()["schedule"]["daily"] == "02:30"
+
+
+def test_expired_instruction_writes_an_encrypted_failure_receipt(store):
+    public, secret = seed_control_key(store)
+    env, session, reply_secret = make_instruction("schedule", {"daily": "02:30"}, public, secret)
+    instruction = crypto.unseal(json.loads(env["WXREAD_INSTRUCTION"]), secret)
+    instruction["issued_at"] = int(time.time()) - 120
+    env["WXREAD_INSTRUCTION"] = json.dumps(crypto.seal(instruction, public))
+    assert cmd_control(store, env) == 1
+    receipt = crypto.unseal(store.read_response(session), reply_secret)
+    assert receipt["ok"] is False and "过期" in receipt["error"]
+    assert "schedule" not in store.load_settings()
+
+
+def test_github_run_creation_time_is_read_from_the_actions_endpoint():
+    from types import SimpleNamespace
+    from wxread.state import GitHubContents
+
+    calls = []
+    response = SimpleNamespace(status_code=200, json=lambda: {"created_at": "2026-11-23T16:00:00Z"})
+    session = SimpleNamespace(headers={}, get=lambda url, **kwargs: calls.append((url, kwargs)) or response)
+    backend = GitHubContents("owner/repo", "test-token", session=session)
+    assert backend.run_created_at("123") == 1795449600
+    assert calls[0][0] == "https://api.github.com/repos/owner/repo/actions/runs/123"

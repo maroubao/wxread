@@ -118,6 +118,23 @@ class GitHubContents:
     def _url(self, path: str) -> str:
         return f"{self._api}/repos/{self.repo}/contents/{path.lstrip('/')}"
 
+    def run_created_at(self, run_id: str) -> int:
+        """GitHub 接收本次运行的时间，包含 runner 排队之前的时刻。"""
+        if not str(run_id).isdigit():
+            raise StateReadError("GITHUB_RUN_ID 不是合法运行编号")
+        try:
+            response = self._session.get(
+                f"{self._api}/repos/{self.repo}/actions/runs/{run_id}", timeout=self._timeout
+            )
+            if response.status_code != 200:
+                raise StateReadError(f"读取运行时间失败：HTTP {response.status_code}")
+            created = datetime.fromisoformat(response.json()["created_at"].replace("Z", "+00:00"))
+        except (requests.RequestException, KeyError, ValueError, TypeError) as exc:
+            raise StateReadError("无法读取 GitHub 接收运行的时间") from exc
+        if created.tzinfo is None:
+            raise StateReadError("GitHub 运行时间缺少时区")
+        return int(created.timestamp())
+
     def ensure_branch(self, source: str = "main") -> None:
         """分支不存在时从 source 创建（空仓库则无从创建，抛 StateError）。"""
         ref_url = f"{self._api}/repos/{self.repo}/git/ref/heads/{self.branch}"
