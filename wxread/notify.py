@@ -65,6 +65,22 @@ def render_failure(account_label: str, reason: str, hint: str = "") -> tuple[str
     return title, text
 
 
+def render_read_alert(record: Mapping) -> tuple[str, str]:
+    label = str(record.get("label") or record.get("account_id") or "账户")
+    reason = str(record.get("reason") or "")
+    if record.get("level") == "L3":
+        if reason in {"payload_invalid", "no_synckey"}:
+            return f"{DEFAULT_SUBJECT_PREFIX} 自动取参需重试：{label}", scrub(f"{label} 的阅读参数需要更新，控制台可重新自动获取。")
+        return render_failure(label, reason, "重新扫码后恢复每日阅读")
+    count = int(record.get("read_count") or 0)
+    target = int(record.get("target_count") or 0)
+    recovered = count >= target and int(record.get("exit_code", 0)) == 0
+    status = "阅读已恢复" if recovered else "阅读未完成"
+    if record.get("state_error"):
+        status = "阅读结果保存失败"
+    return f"{DEFAULT_SUBJECT_PREFIX} {status}：{label}", scrub(f"{label}：{count}/{target} 次，原因 {reason}")
+
+
 def render_test(channel: str) -> tuple[str, str]:
     return f"{DEFAULT_SUBJECT_PREFIX} 测试通知（{channel}）", f"这是一条来自 wxread 的测试消息：{channel} 通道可用。"
 
@@ -155,7 +171,7 @@ def send(channel: str, cfg: Mapping, title: str, text: str) -> NotifyResult:
         return NotifyResult(channel, False, f"未知渠道 {channel}")
     try:
         leftover = sender(cfg, title, text)
-    except NotifyError as exc:
+    except (NotifyError, ValueError, TypeError) as exc:
         return NotifyResult(channel, False, str(exc))
     if leftover:
         return NotifyResult(channel, False, f"接口返回异常：{leftover}")
@@ -173,5 +189,8 @@ def dispatch(settings: Mapping, title: str, text: str, channels: list[str] | Non
         if channel not in CHANNELS:
             results.append(NotifyResult(channel, False, "未支持的渠道"))
             continue
-        results.append(send(channel, dict(block.get(channel) or {}), title, text))
+        try:
+            results.append(send(channel, dict(block.get(channel) or {}), scrub(title), scrub(text)))
+        except Exception as exc:
+            results.append(NotifyResult(channel, False, scrub(str(exc))))
     return results

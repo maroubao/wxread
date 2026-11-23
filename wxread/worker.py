@@ -236,6 +236,18 @@ def cmd_read(store: StateStore, env: Mapping[str, str], transport_factory=None, 
     state_errors = [record for record in records if int(record.get("exit_code", 0)) == EXIT_STATE]
     log.info("本次共读 %s 次，账户 %s 个，失败 %s 个", total, len(records), len(failed))
     print(f"::notice::session done reads={total} accounts={len(records)} failed={len(failed)} since={started}", flush=True)
+    alerts = [record for record in records if record.get("level") in {"L2", "L3"} and record.get("reason") != "cancelled"]
+    if alerts:
+        from . import notify
+        try:
+            settings = store.load_settings()
+            for record in alerts:
+                title, message = notify.render_read_alert(record)
+                for delivery in notify.dispatch(settings, title, message):
+                    if not delivery.ok:
+                        log.warning("通知 %s 发送失败：%s", delivery.channel, scrub(delivery.detail))
+        except StateError as exc:
+            log.warning("通知设置读取失败：%s", scrub(str(exc)))
     if state_errors:
         return EXIT_STATE
     if records and len(failed) == len(records):

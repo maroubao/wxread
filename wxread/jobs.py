@@ -172,11 +172,15 @@ class JobRunner:
             self._save(account, strict=True)
         except StateError as exc:
             record.update({"state_error": scrub(str(exc)), "exit_code": 4})
+            if record["level"] in {"L0", "L1"}:
+                record.update({"level": "L2", "reason": "state_error"})
             log.error("账户 %s 最终写回失败：%s", account.id, scrub(str(exc)))
         try:
             self.store.append_run(record)
         except StateError as exc:
             record.update({"state_error": scrub(str(exc)), "exit_code": 4})
+            if record["level"] in {"L0", "L1"}:
+                record.update({"level": "L2", "reason": "state_error"})
             log.error("账户 %s 记录写回失败：%s", account.id, scrub(str(exc)))
 
     def run(self, accounts: Iterable[Account]) -> list[dict]:
