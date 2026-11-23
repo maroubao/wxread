@@ -136,5 +136,5 @@ def test_all_accounts_failed_returns_1():
     store.save_account(account.to_dict())
     from test_reader import TransportError
 
-    factory = lambda: FakeTransport([TransportError("x")] * 4 + [ok()] * 3)
+    factory = lambda: FakeTransport([TransportError("x")] * 100)
     assert worker.cmd_read(store, env, transport_factory=factory, sleep=lambda _s: None) == worker.EXIT_ALL_FAILED

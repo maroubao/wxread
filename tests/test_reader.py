@@ -12,6 +12,7 @@ from wxread.reader import (
     READ_URL,
     RENEW_URL,
     Reader,
+    RequestsTransport,
     TransportError,
     TransportResponse,
     build_payload,
@@ -130,14 +131,14 @@ def test_transport_error_backs_off_then_renews():
     assert outcome.renewals == 1
 
 
-def test_renewal_failure_is_l3():
+def test_unavailable_renewal_after_network_failure_remains_retryable():
     script = [TransportError("boom")] * 4 + [TransportResponse(200, {})] * 3
     reader, account, _transport, _ = make_reader(script, target=1)
     outcome = reader.run()
     assert outcome.read_count == 0
-    assert outcome.level == "L3" and outcome.reason == "renew_failed"
+    assert outcome.level == "L2"
     assert outcome.exit_code == 3
-    assert account.status == "needs_login"
+    assert account.status == "ok"
 
 
 def test_persistent_session_error_stops_account():
@@ -150,7 +151,8 @@ def test_persistent_session_error_stops_account():
 
 
 def test_unknown_failure_is_payload_invalid():
-    reader, _account, _transport, _ = make_reader([TransportResponse(200, {"succ": 0, "errcode": -1})], target=1)
+    failure = TransportResponse(200, {"succ": 0, "errcode": -1})
+    reader, _account, _transport, _ = make_reader([failure, ok(), failure, renew_ok(), failure], target=1)
     outcome = reader.run()
     assert outcome.level == "L3" and outcome.reason == "payload_invalid"
 
@@ -214,3 +216,60 @@ def test_build_payload_drops_stale_signature_fields():
     base = {"appId": "wb1", "ps": "p", "pc": "c", "s": "stale", "ts": 1, "rn": 2, "sg": "old"}
     payload = build_payload(base, now=1_700_000_000, last_read_at=1_699_999_900, rand=random.Random(1))
     assert payload["ts"] != 1 and payload["sg"] != "old"
+
+
+def test_error_response_cookies_are_retained():
+    from types import SimpleNamespace
+
+    response = SimpleNamespace(status_code=503, content=b"unavailable", cookies={"wr_skey": "rotated-on-error"})
+    session = SimpleNamespace(post=lambda *args, **kwargs: response)
+    account = account_from_curl(CURL_SAMPLE)
+    reader = Reader(account, RequestsTransport(session), pace=0, sleep=lambda _s: None)
+    reader.run()
+    assert account.cookies["wr_skey"] == "rotated-on-error"
+    assert account.status == "ok"
+
+
+def test_network_outage_does_not_mark_the_login_invalid():
+    reader, account, transport, _ = make_reader([TransportError("offline")] * 100, target=1)
+    outcome = reader.run()
+    assert account.status == "ok"
+    assert outcome.level in {"L1", "L2"}
+    assert len(transport.calls) <= 12
+
+
+def test_invalid_json_does_not_discard_rotated_cookies():
+    from types import SimpleNamespace
+
+    def invalid_json():
+        raise ValueError("invalid JSON")
+
+    response = SimpleNamespace(status_code=200, content=b"invalid", cookies={"wr_skey": "rotated-invalid-json"}, json=invalid_json)
+    session = SimpleNamespace(post=lambda *args, **kwargs: response)
+    account = account_from_curl(CURL_SAMPLE)
+    Reader(account, RequestsTransport(session), pace=0, sleep=lambda _s: None).run()
+    assert account.cookies["wr_skey"] == "rotated-invalid-json"
+
+
+def test_alternating_failure_types_cannot_reset_recovery_budget():
+    cycle = [TransportError("offline")] * 4 + [renew_ok(), err(-2012), renew_ok()]
+    reader, _account, transport, _ = make_reader(cycle * 5, target=1)
+    outcome = reader.run()
+    assert outcome.read_count == 0
+    assert len(transport.calls) <= 14
+
+
+def test_first_read_waits_for_the_reported_reading_interval():
+    account = account_from_curl(CURL_SAMPLE)
+    account.target_count = 2
+    moment = [1_700_000_000.0]
+    intervals = []
+
+    def sleep(seconds):
+        intervals.append(seconds)
+        moment[0] += seconds
+
+    transport = FakeTransport([ok(), ok()])
+    Reader(account, transport, pace=30, clock=lambda: moment[0], sleep=sleep).run()
+    assert [body["rt"] for _url, body in transport.calls] == [30, 30]
+    assert sum(intervals) == 60
