@@ -12,6 +12,7 @@ Playwright 是可选的运行期依赖：测试注入假页面，不需要浏览
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import time
 from dataclasses import dataclass, field
@@ -135,6 +136,17 @@ class ChromeLoginPage:
             pass
 
     EXPIRED_HINT = "点击刷新二维码"
+    # 手机扫过之后微信读书换这些文案；此时整页重开等于把这次登录取消掉
+    SCAN_HINTS = ("扫描成功", "请在手机上确认", "已扫码", "确认登录")
+
+    def scanned(self) -> bool:
+        """手机上已扫、等确认。这期间**不能**重开页面，否则微信侧会报"登录失败，请重新扫码"。"""
+        assert self._page is not None
+        try:
+            content = self._page.content() or ""
+        except Exception:
+            return False
+        return any(hint in content for hint in self.SCAN_HINTS)
 
     def _refresh_if_expired(self) -> bool:
         """二维码到期后微信读书会盖一层"点击刷新二维码"，点掉它再截。"""
@@ -150,8 +162,18 @@ class ChromeLoginPage:
         return False
 
     def qr_png(self) -> bytes | None:
+        """优先返回站点自己给的二维码位图，其次才是截图。
+
+        CI 的 headless Chrome 没装中文字体：二维码过期后微信读书会盖一层
+        "点击刷新二维码"，那行汉字在容器里渲染成一串空方块，正好压在码上，
+        于是"第 4 张开始扫不动"。直接读 `<img src="data:image/png;base64,...">`
+        拿到的是干净位图，没有文字、没有浮层、也不受 DPR 影响。
+        """
         assert self._page is not None
         self._refresh_if_expired()
+        data = self._qr_data_url()
+        if data:
+            return data
         for selector in QR_SELECTORS:
             element = self._page.query_selector(selector)
             if element is None:
@@ -169,6 +191,31 @@ class ChromeLoginPage:
             return self._page.screenshot()
         except Exception:
             return None
+
+    def _qr_data_url(self) -> bytes | None:
+        """从 `data:image/png;base64,...` 里取二维码原始字节。"""
+        assert self._page is not None
+        for selector in QR_SELECTORS:
+            try:
+                element = self._page.query_selector(selector)
+            except Exception:
+                continue
+            if element is None:
+                continue
+            try:
+                src = element.get_attribute("src") or ""
+            except Exception:
+                continue
+            if not src.startswith("data:image"):
+                continue
+            _, _, payload = src.partition(",")
+            try:
+                raw = base64.b64decode(payload)
+            except Exception:
+                continue
+            if len(raw) > 512:
+                return raw
+        return None
 
     def _expired_overlay(self) -> bool:
         assert self._page is not None
@@ -227,6 +274,7 @@ def wait_for_login(
     shots: list[QrShot] = []
     last_fp = ""
     next_refresh = refresh_after
+    scanned_check = getattr(page, "scanned", None)
     while True:
         cookies = page.cookies()
         if cookies.get("wr_vid") and cookies.get("wr_skey"):
@@ -246,14 +294,17 @@ def wait_for_login(
         if elapsed >= timeout:
             return QrResult(ok=False, shots=shots, waited=elapsed, reason="timeout")
         if refresh_after and elapsed >= next_refresh:
-            reopen = getattr(page, "reopen", None)
-            if reopen is not None:
-                try:
-                    reopen()
-                except Exception:
-                    pass
-                last_fp = ""  # 重开后即便同图也重新上报一次
-            next_refresh = elapsed + refresh_after
+            if callable(scanned_check) and scanned_check():
+                next_refresh = elapsed + refresh_after  # 手机扫过了：安静等确认，别打断
+            else:
+                reopen = getattr(page, "reopen", None)
+                if reopen is not None:
+                    try:
+                        reopen()
+                    except Exception:
+                        pass
+                    last_fp = ""  # 重开后即便同图也重新上报一次
+                next_refresh = elapsed + refresh_after
         sleep(min(poll, max(0.1, timeout - elapsed)))
 
 

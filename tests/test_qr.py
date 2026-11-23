@@ -1,5 +1,6 @@
-from wxread import qr
+import base64
 
+from wxread import qr
 
 class FakePage:
     """脚本化页面：每次 `qr_png()` 取下一帧；第 `login_at` 次轮询后返回登录 cookie。"""
@@ -105,3 +106,58 @@ def test_account_from_cookies_flags_missing_payload():
 def test_describe_mentions_failure_reason():
     result = qr.QrResult(ok=False, reason="timeout", shots=[qr.QrShot("f", b"x", 0.0)], waited=600)
     assert "超时" in qr.describe(result)
+
+
+class FakeElement:
+    def __init__(self, src: str):
+        self._src = src
+
+    def get_attribute(self, name: str):
+        return self._src if name == "src" else None
+
+
+class FakeDomPage:
+    """只实现取 src / content 的最小 DOM，用来测二维码位图提取。"""
+
+    def __init__(self, mapping: dict[str, str], content_text: str = ""):
+        self.mapping = mapping
+        self.content_text = content_text
+
+    def query_selector(self, selector: str):
+        src = self.mapping.get(selector)
+        return FakeElement(src) if src is not None else None
+
+    def content(self) -> str:
+        return self.content_text
+
+
+def test_qr_prefers_the_sites_own_bitmap():
+    """CI 没有中文字体，截图会把过期提示渲染成方块压住码；直接取 data URL 的原始字节。"""
+    png = b"\x89PNG\r\n\x1a\n" + b"q" * 700
+    page = qr.ChromeLoginPage()
+    page._page = FakeDomPage({qr.QR_SELECTORS[0]: "data:image/png;base64," + base64.b64encode(png).decode()})
+
+    assert page.qr_png() == png
+
+
+def test_qr_ignores_non_data_url_until_screenshot_fallback():
+    page = qr.ChromeLoginPage()
+    page._page = FakeDomPage({qr.QR_SELECTORS[0]: "https://cdn.example.com/qr.png"})
+
+    assert page.qr_png() is None
+
+
+class ScannedPage(ReopeningPage):
+    """手机已扫、等确认：这个阶段不能再重开页面，否则微信侧取消登录。"""
+
+    def scanned(self) -> bool:
+        return True
+
+
+def test_scanned_page_is_never_reopened():
+    page = ScannedPage([b"a" * 600], login_at=None)
+    result = qr.wait_for_login(
+        page, timeout=20, poll=1, now=make_clock(step=1), sleep=lambda _s: None, refresh_after=3
+    )
+    assert result.reason == "timeout"
+    assert page.reopens == 0
