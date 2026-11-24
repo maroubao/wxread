@@ -66,6 +66,8 @@ read/warm 共享 wxread-session 并发组。control 按 session 分组；不同�
 
 账户 id 从稳定 wr_vid 派生。同号重绑更新凭据并保留人工设置；停用账户重绑后仍需手动启用。
 
+旧配置只在首次空状态时迁移，完成后在加密设置写 legacy_import_disabled。显式删除账户前也设置此标记，避免最后一个账户删除后被旧 Secret 重建；worker 的运行时回写只接受仍在状态分支的账户。
+
 WXREAD_STATE_KEY 是随机 32 字节对称密钥；WXREAD_CONTROL_SK 是独立指令私钥；control.json 存对应公钥。页面只需要 token 和状态密钥。正常升级保持密钥/版本不变，当前没有全量密钥轮换或跨仓库重新加密工具。
 
 Cookie/口令在 worker 内存和持有状态密钥的浏览器解密内存中使用；可选记住会在浏览器保存 token/状态密钥 24 小时。日志与通知不应含 Cookie 或渠道口令。本机真扫码工具可写忽略的凭据文件，维护者必须保密。

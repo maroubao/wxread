@@ -85,3 +85,13 @@ JobRunner通过finally写最终结果，异常账户不会终止后续账户。�
 补充并发扫码清理保护、旧登录态取参不覆盖新登录、账户和表单防重复提交、指定账户摘要范围，以及同批重跑按最新结果判定账户完成。桌面与手机实际浏览器检查无横向溢出，页面增加使用/维护资料入口；断开后等待多个轮询周期，账户未被旧回调恢复。
 
 GitHub修复分支的云端tests已通过，Python 3.12/Node 24及固定依赖安装成功。默认30秒节奏的真实云端阅读正在验收，结果将在后续段落独立记录。
+
+## 真实云端验收（2026-11-24）
+
+- [正常节奏阅读与汇总](https://github.com/maroubao/wxread/actions/runs/45382238850)：plan/read/report全成功。默认30秒间隔完成40/40次，账户记录exit_code=0。期间err_-2012经L2自动恢复，读取从11:14:31 UTC到11:35:06 UTC，约1235秒。状态由真实Contents API写入wxread-state。
+- 飞书通知在真实加密control指令中启用，回执确认channels=[feishu]。report成功代表现有机器人接口返回成功码，未由用户人工确认手机端实际提示。
+- [真实保活](https://github.com/maroubao/wxread/actions/runs/45384882529)：ok=1、failed=0，排队等待阅读后执行，验证共享互斥组。
+- [已有登录态云端自动取参](https://github.com/maroubao/wxread/actions/runs/45386118128)：Chrome自动正文请求获确认，控制回执ok=true、payload_captured=true，实际GitHub密文账户更新；没有导入cURL。
+- [云端测试](https://github.com/maroubao/wxread/actions/runs/45382433573)：Python 3.12和Node 24两作业全绿。后续新增回归会随最终PR再次验证。
+
+最后补充三项回归：旧Secret下删除最后账户不复活、首次旧配置迁移仅一次、加载列表之后删除不会被worker启动回写重建。前两项在修复前失败，修复后相关35项通过，计划和通知保持。新字段只为旧配置迁移/删除保护，普通升级不改密钥或现有账户。

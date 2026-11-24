@@ -141,6 +141,8 @@ def load_accounts(store: StateStore, env: Mapping[str, str]) -> list[Account]:
     legacy_json = _env(env, "WXREAD_ACCOUNTS_JSON")
     if not legacy_curl and not legacy_json:
         return []
+    if store.load_settings().get("legacy_import_disabled"):
+        return []
     try:
         migrated = from_legacy(legacy_curl, legacy_json)
     except (AccountError, MissingFieldsError) as exc:
@@ -148,6 +150,7 @@ def load_accounts(store: StateStore, env: Mapping[str, str]) -> list[Account]:
     for account in migrated:
         store.save_account(account.to_dict(), f"chore(state): migrate {account.id}")
         log.info("已迁移账户 %s（%s）", account.id, account.label)
+    store.mutate_settings(lambda settings: {**settings, "legacy_import_disabled": True})
     return sorted(migrated, key=lambda item: item.id)
 
 
@@ -284,13 +287,17 @@ def cmd_report(store: StateStore, env: Mapping[str, str]) -> int:
             records.append({**progress, "account_id": account.id, "label": account.label, "level": "L2", "reason": "workflow_interrupted", "exit_code": 2})
     title, message = notify.render_daily_report(records, [account.to_dict() for account in accounts])
     settings = notification_settings(store, env)
-    if "feishu" not in (settings.get("notifications") or {}).get("channels", []):
+    notifications = settings.get("notifications") or {}
+    if not notifications.get("enabled") or "feishu" not in notifications.get("channels", []):
+        log.info("飞书摘要未启用，跳过本批发送")
         return EXIT_OK
     deliveries = notify.dispatch(settings, title, message, channels=["feishu"])
     for delivery in deliveries:
         if not delivery.ok:
             log.warning("飞书摘要发送失败：%s", scrub(delivery.detail))
-    return EXIT_OK if all(delivery.ok for delivery in deliveries) else EXIT_ALL_FAILED
+    accepted = bool(deliveries) and all(delivery.ok for delivery in deliveries)
+    print(f"::notice::feishu summary accepted={str(accepted).lower()} records={len(records)}", flush=True)
+    return EXIT_OK if accepted else EXIT_ALL_FAILED
 
 
 def cmd_read(store: StateStore, env: Mapping[str, str], transport_factory=None, sleep=None) -> int:
@@ -315,6 +322,7 @@ def cmd_read(store: StateStore, env: Mapping[str, str], transport_factory=None, 
         deadline=deadline,
         on_event=_print_event,
         batch_id=str(_env(env, "WXREAD_BATCH_ID") or _env(env, "GITHUB_RUN_ID") or ""),
+        existing_only=True,
         **({"sleep": sleep} if sleep is not None else {}),
     )
     started = utcnow_iso()

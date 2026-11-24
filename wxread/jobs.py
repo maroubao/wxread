@@ -39,6 +39,7 @@ class JobRunner:
         deadline: float | None = None,
         on_event: Callable[[JobEvent], None] | None = None,
         batch_id: str = "",
+        existing_only: bool = False,
     ) -> None:
         self.store = store
         self.transport_factory = transport_factory
@@ -48,6 +49,7 @@ class JobRunner:
         self.deadline = deadline
         self.on_event = on_event
         self.batch_id = batch_id
+        self.existing_only = existing_only
         self._cancelled = False
         self._baselines: dict[str, dict | None] = {}
         self._superseded: set[str] = set()
@@ -102,7 +104,9 @@ class JobRunner:
             "batch_id": self.batch_id,
         }
         try:
-            self._baselines[account.id] = self.store.load_account(account.id)
+            loaded = self.store.load_account(account.id)
+            if loaded is not None or not self.existing_only:
+                self._baselines[account.id] = loaded
             self._save(account)
             reader = Reader(
                 account,

@@ -141,6 +141,8 @@ GitHub 头像 → Settings → Developer settings → Personal access tokens →
 
 「还差」按各账户的缺口累加，某个账户的超额阅读不会抵扣其他账户尚未达到的目标。
 
+旧 Secret 的自动导入只用于首次迁移。删除账户后不会因为旧 Secret 仍在而自动重建，重新使用要显式扫码。
+
 桌面行内按钮悬停有说明，也可用 Tab 聚焦读取名称；手机显示同样的操作。
 
 | 操作 | 怎么做 | 结果 |

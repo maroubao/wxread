@@ -351,6 +351,7 @@ def handle_delete(ctx: ControlContext, payload: Mapping[str, Any]) -> dict:
         raise ControlError("delete 需要 account_id")
     if not ctx.store.load_account(account_id):
         raise ControlError(f"账户不存在 {account_id}")
+    ctx.store.mutate_settings(lambda settings: {**settings, "legacy_import_disabled": True})
     ctx.store.delete_account(account_id, message="control: delete")
     return {"ok": True, "account_id": account_id, "deleted": True}
 
