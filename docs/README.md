@@ -11,6 +11,7 @@
 | 视觉依据、无障碍与桌面/手机布局 | [DESIGN.md](DESIGN.md)、[design/](design/) |
 | 加密和信任边界 | [THREAT-MODEL.md](THREAT-MODEL.md)；当前连接保存行为同时见 ARCHITECTURE |
 | 本轮具体修复与真实/替身验证范围 | [reviews/G2-repair.md](reviews/G2-repair.md) |
+| 独立审核、补修和正式发布结果 | [reviews/G3-release.md](reviews/G3-release.md) |
 | 原始计划及旧实施门 | [PLAN.md](PLAN.md)、[REVIEW.md](REVIEW.md)、[reviews/](reviews/) |
 
 当前三个核心要求是 GitHub 全托管、扫码自动取参无需 cURL、每日读后飞书摘要。页面目标显示分钟，底层目标仍为请求次数，1 次按 30 秒折算；默认 40 次约 20 分钟。计划由工作流固定为北京 01:07 和每 6 小时保活，页面只控制开关。
