@@ -94,7 +94,7 @@ def wait_receipt(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="本机下发密文指令到 control.yml")
-    parser.add_argument("action", help="init/qr/import/update/delete/schedule/notifications/test-mail/test-push")
+    parser.add_argument("action", help="init/qr/capture/import/update/delete/stop/schedule/notifications/test-mail/test-push")
     parser.add_argument("--repo", default=os.environ.get("WXREAD_REPO", ""), help="owner/repo")
     parser.add_argument("--token", default=os.environ.get("GITHUB_TOKEN", ""))
     parser.add_argument("--branch", default=os.environ.get("WXREAD_STATE_BRANCH", "wxread-state"))

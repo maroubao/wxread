@@ -15,7 +15,7 @@
     WXREAD_ACCOUNTS_JSON     旧配置（多账户数组），迁移用
     WXREAD_TARGET_COUNT      覆盖账户默认目标数
     WXREAD_PACE              两次阅读间隔秒数（测试用，默认 30）
-    WXREAD_DEADLINE          单账户上限秒数（默认 1200）
+    WXREAD_DEADLINE          单账户上限秒数（0 按目标与请求余量计算）
     WXREAD_KEYS              轮换期旧密钥，形如 "1:<b64>,2:<b64>"
 """
 
@@ -25,15 +25,19 @@ import argparse
 import base64
 import json
 import logging
+import math
 import os
+import signal
 import sys
+import threading
+from datetime import datetime, timezone
 from typing import Mapping
 
 from .crypto import CryptoFailure, b64d
 from .accounts import Account, AccountError, MissingFieldsError, clamp_target_count, from_legacy
 from .jobs import JobEvent, JobRunner
 from .logsafe import scrub
-from .reader import DEFAULT_DEADLINE, DEFAULT_PACE
+from .reader import DEFAULT_PACE, reading_deadline
 from .state import DEFAULT_BRANCH, GitHubContents, StateError, StateStore, utcnow_iso
 
 log = logging.getLogger("wxread.worker")
@@ -121,17 +125,23 @@ def build_store(env: Mapping[str, str], backend=None) -> StateStore:
 def load_accounts(store: StateStore, env: Mapping[str, str]) -> list[Account]:
     """状态分支里已有的账户优先；为空时才读旧 secret（并迁移）。"""
     accounts: list[Account] = []
-    for account_id, payload in store.load_accounts().items():
+    account_ids = store.list_account_ids()
+    for account_id in account_ids:
         try:
+            payload = store.load_account(account_id)
+            if payload is None:
+                continue
             accounts.append(Account.from_dict(payload, account_id))
-        except AccountError as exc:
+        except (AccountError, StateError, ValueError, TypeError) as exc:
             log.error("账户 %s 数据损坏：%s", account_id, scrub(str(exc)))
-    if accounts:
+    if account_ids:
         return sorted(accounts, key=lambda item: item.id)
 
     legacy_curl = _env(env, "WXREAD_CURL_BASH")
     legacy_json = _env(env, "WXREAD_ACCOUNTS_JSON")
     if not legacy_curl and not legacy_json:
+        return []
+    if store.load_settings().get("legacy_import_disabled"):
         return []
     try:
         migrated = from_legacy(legacy_curl, legacy_json)
@@ -140,6 +150,7 @@ def load_accounts(store: StateStore, env: Mapping[str, str]) -> list[Account]:
     for account in migrated:
         store.save_account(account.to_dict(), f"chore(state): migrate {account.id}")
         log.info("已迁移账户 %s（%s）", account.id, account.label)
+    store.mutate_settings(lambda settings: {**settings, "legacy_import_disabled": True})
     return sorted(migrated, key=lambda item: item.id)
 
 
@@ -176,11 +187,13 @@ def cmd_migrate(store: StateStore, env: Mapping[str, str]) -> int:
     return EXIT_OK
 
 
-def schedule_gate(store: StateStore, mode: str) -> str:
+def schedule_gate(store: StateStore, mode: str, *, automatic: bool = True) -> str:
     """`settings.schedule` 的运行时开关：cron 写死在 workflow 里，只能在这里拦。
 
     返回空串表示放行，否则返回拦截原因（调用方打 notice 后正常退出）。
     """
+    if not automatic:
+        return ""
     try:
         settings = store.load_settings()
     except StateError as exc:  # 设置读失败不该让定时任务全挂
@@ -194,34 +207,160 @@ def schedule_gate(store: StateStore, mode: str) -> str:
     return ""
 
 
+def notification_settings(store: StateStore, env: Mapping[str, str]) -> dict:
+    settings = store.load_settings()
+    webhook = _env(env, "FEISHU_WEBHOOK") or _env(env, "WXREAD_FEISHU_WEBHOOK")
+    block = settings.get("notifications")
+    if webhook and (block is None or ("feishu" in block.get("channels", []) and not (block.get("feishu") or {}).get("webhook"))):
+        def migrate(current: dict) -> dict:
+            notifications = dict(current.get("notifications") or {"enabled": True, "channels": ["feishu"]})
+            feishu = dict(notifications.get("feishu") or {})
+            feishu.setdefault("webhook", webhook)
+            notifications["feishu"] = feishu
+            current["notifications"] = notifications
+            return current
+        settings = store.mutate_settings(migrate)
+        log.info("deprecated: FEISHU_WEBHOOK已迁入加密通知配置")
+    return settings
+
+
+def read_options(env: Mapping[str, str]) -> tuple[float, float | None]:
+    try:
+        pace = float(_env(env, "WXREAD_PACE", str(DEFAULT_PACE)))
+        deadline = float(_env(env, "WXREAD_DEADLINE", "0"))
+    except (ValueError, TypeError) as exc:
+        raise ConfigError("读取参数必须是数字") from exc
+    if not math.isfinite(pace) or not 0 <= pace <= 30:
+        raise ConfigError("读取间隔必须在0到30秒之间")
+    if not math.isfinite(deadline) or not 0 <= deadline <= 19800:
+        raise ConfigError("读取截止时间必须在0到19800秒之间")
+    return pace, deadline or None
+
+
+def read_matrix(accounts: list[Account], pace: float, deadline: float | None) -> dict:
+    groups = []
+    ids: list[str] = []
+    seconds = 0.0
+    for account in accounts:
+        if not account.enabled or account.status != "ok":
+            continue
+        budget = reading_deadline(account, pace, deadline)
+        if ids and (len(ids) >= 5 or seconds + budget > 330 * 60):
+            groups.append({"account_ids": ",".join(ids), "timeout_minutes": math.ceil(seconds / 60) + 3})
+            ids, seconds = [], 0.0
+        ids.append(account.id)
+        seconds += budget
+    if ids:
+        groups.append({"account_ids": ",".join(ids), "timeout_minutes": math.ceil(seconds / 60) + 3})
+    return {"include": groups}
+
+
+def cmd_plan(store: StateStore, env: Mapping[str, str]) -> int:
+    allowed = not schedule_gate(store, "read", automatic=env.get("GITHUB_EVENT_NAME") != "workflow_dispatch")
+    accounts = load_accounts(store, env) if allowed else []
+    apply_env_overrides(accounts, env)
+    selected = [item.strip() for item in (_env(env, "WXREAD_ACCOUNT_IDS") or "").split(",") if item.strip()]
+    if selected:
+        accounts = [account for account in accounts if account.id in selected]
+    pace, deadline = read_options(env)
+    matrix = read_matrix(accounts, pace, deadline)
+    text = json.dumps(matrix, separators=(",", ":"))
+    if env.get("GITHUB_OUTPUT"):
+        with open(env["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+            output.write(f"matrix={text}\ncount={len(matrix['include'])}\nallowed={str(allowed).lower()}\n")
+    print(text, flush=True)
+    return EXIT_OK
+
+
+def cmd_report(store: StateStore, env: Mapping[str, str]) -> int:
+    from . import notify
+    batch_id = str(_env(env, "WXREAD_BATCH_ID") or _env(env, "GITHUB_RUN_ID") or "")
+    accounts = load_accounts(store, env)
+    selected = [item.strip() for item in (_env(env, "WXREAD_ACCOUNT_IDS") or "").split(",") if item.strip()]
+    if selected:
+        accounts = [account for account in accounts if account.id in selected]
+    records = [record for record in store.recent_runs(limit=200) if record.get("batch_id") == batch_id]
+    known = {record.get("run_id") for record in records}
+    for account in accounts:
+        progress = account.extra.get("progress") or {}
+        if progress.get("batch_id") == batch_id and progress.get("run_id") not in known:
+            records.append({**progress, "account_id": account.id, "label": account.label, "level": "L2", "reason": "workflow_interrupted", "exit_code": 2})
+    title, message = notify.render_daily_report(records, [account.to_dict() for account in accounts])
+    settings = notification_settings(store, env)
+    notifications = settings.get("notifications") or {}
+    if not notifications.get("enabled") or "feishu" not in notifications.get("channels", []):
+        log.info("飞书摘要未启用，跳过本批发送")
+        return EXIT_OK
+    deliveries = notify.dispatch(settings, title, message, channels=["feishu"])
+    for delivery in deliveries:
+        if not delivery.ok:
+            log.warning("飞书摘要发送失败：%s", scrub(delivery.detail))
+    accepted = bool(deliveries) and all(delivery.ok for delivery in deliveries)
+    print(f"::notice::feishu summary accepted={str(accepted).lower()} records={len(records)}", flush=True)
+    return EXIT_OK if accepted else EXIT_ALL_FAILED
+
+
 def cmd_read(store: StateStore, env: Mapping[str, str], transport_factory=None, sleep=None) -> int:
-    blocked = schedule_gate(store, "read")
+    blocked = schedule_gate(store, "read", automatic=env.get("GITHUB_EVENT_NAME") != "workflow_dispatch")
     if blocked:
         log.info("跳过本次阅读：%s", blocked)
         print(f"::notice::read skipped: {blocked}", flush=True)
         return EXIT_OK
     accounts = load_accounts(store, env)
     apply_env_overrides(accounts, env)
+    selected = [item.strip() for item in (_env(env, "WXREAD_ACCOUNT_IDS") or "").split(",") if item.strip()]
+    if selected:
+        accounts = [account for account in accounts if account.id in selected]
     if not accounts:
-        log.error("没有任何账户：先扫码绑定或导入 curl")
+        log.error("没有任何账户：先在控制台扫码绑定")
         return EXIT_CONFIG
-    pace = float(_env(env, "WXREAD_PACE", str(DEFAULT_PACE)) or DEFAULT_PACE)
-    deadline = float(_env(env, "WXREAD_DEADLINE", str(DEFAULT_DEADLINE)) or DEFAULT_DEADLINE)
+    pace, deadline = read_options(env)
     runner = JobRunner(
         store,
         transport_factory=transport_factory,
         pace=pace,
         deadline=deadline,
         on_event=_print_event,
+        batch_id=str(_env(env, "WXREAD_BATCH_ID") or _env(env, "GITHUB_RUN_ID") or ""),
+        existing_only=True,
         **({"sleep": sleep} if sleep is not None else {}),
     )
     started = utcnow_iso()
-    records = runner.run(accounts)
+    previous_handlers = {}
+    if threading.current_thread() is threading.main_thread():
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            previous_handlers[signum] = signal.signal(signum, lambda _signum, _frame: runner.cancel())
+    try:
+        records = runner.run(accounts)
+    finally:
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
     total = sum(int(record.get("read_count", 0)) for record in records)
     failed = [record for record in records if int(record.get("exit_code", 0)) not in (0, 2)]
     state_errors = [record for record in records if int(record.get("exit_code", 0)) == EXIT_STATE]
     log.info("本次共读 %s 次，账户 %s 个，失败 %s 个", total, len(records), len(failed))
     print(f"::notice::session done reads={total} accounts={len(records)} failed={len(failed)} since={started}", flush=True)
+    alerts = [record for record in records if record.get("level") in {"L2", "L3"} and record.get("reason") != "cancelled"]
+    if records or alerts:
+        from . import notify
+        try:
+            settings = notification_settings(store, env)
+            channels = list((settings.get("notifications") or {}).get("channels") or [])
+            if "feishu" in channels and _env(env, "WXREAD_REPORT_MODE") != "defer":
+                title, message = notify.render_daily_report(records, [account.to_dict() for account in accounts])
+                for delivery in notify.dispatch(settings, title, message, channels=["feishu"]):
+                    if not delivery.ok:
+                        log.warning("飞书摘要发送失败：%s", scrub(delivery.detail))
+            alert_channels = [channel for channel in channels if channel != "feishu"]
+            for record in alerts:
+                if not alert_channels:
+                    continue
+                title, message = notify.render_read_alert(record)
+                for delivery in notify.dispatch(settings, title, message, channels=alert_channels):
+                    if not delivery.ok:
+                        log.warning("通知 %s 发送失败：%s", delivery.channel, scrub(delivery.detail))
+        except StateError as exc:
+            log.warning("通知设置读取失败：%s", scrub(str(exc)))
     if state_errors:
         return EXIT_STATE
     if records and len(failed) == len(records):
@@ -234,14 +373,14 @@ def cmd_warm(store: StateStore, env: Mapping[str, str], transport_factory=None, 
     from . import warm as warm_mod
     from .reader import RequestsTransport
 
-    blocked = schedule_gate(store, "warm")
+    blocked = schedule_gate(store, "warm", automatic=env.get("GITHUB_EVENT_NAME") != "workflow_dispatch")
     if blocked:
         log.info("跳过本次保活：%s", blocked)
         print(f"::notice::warm skipped: {blocked}", flush=True)
         return EXIT_OK
     accounts = load_accounts(store, env)
     if not accounts:
-        log.error("没有任何账户，先扫码绑定或导入 curl")
+        log.error("没有任何账户，先在控制台扫码绑定")
         return EXIT_CONFIG
     summary = warm_mod.warm_all(
         store,
@@ -255,7 +394,22 @@ def cmd_warm(store: StateStore, env: Mapping[str, str], transport_factory=None, 
     for result in summary.results:
         if result.reason == warm_mod.WARM_REASON_FAILED:
             print(f"::error title=wxread 保活失败::{result.label or result.account_id} {result.note}", flush=True)
-    return EXIT_OK if summary.failed == 0 else EXIT_ALL_FAILED
+    pending = [result for result in summary.results if result.notify]
+    if pending:
+        from . import notify
+        settings = notification_settings(store, env)
+        for result in pending:
+            title, message = notify.render_failure(result.label or result.account_id, result.note, "重新扫码后会恢复每日阅读")
+            deliveries = notify.dispatch(settings, title, message)
+            if all(delivery.ok for delivery in deliveries):
+                def mark_notified(current: dict | None) -> dict | None:
+                    if current is not None and current.get("status") == "needs_login" and int(current.get("warm_failures", 0)) >= 2:
+                        current["warm_notified"] = True
+                    return current
+                store.mutate_account(result.account_id, mark_notified, "chore(state): warm notification")
+    if any(result.reason == warm_mod.WARM_REASON_STATE for result in summary.results):
+        return EXIT_STATE
+    return EXIT_ALL_FAILED if summary.failed and not summary.warmed else EXIT_OK
 
 
 def qr_frame_path(session: str, seq: int, fingerprint: str) -> str:
@@ -270,11 +424,22 @@ def purge_stale_qr(store: StateStore, keep_session: str) -> int:
     except (StateError, NotImplementedError):
         return 0
     removed = 0
+    protected: dict[str, bool] = {}
     for name in names:
         base = name.rsplit("/", 1)[-1]
         if not (base.startswith("qr-") and base.endswith(".png")):
             continue
         if base.startswith(f"qr-{keep_session}-"):
+            continue
+        session = base.rsplit("-", 2)[0][3:]
+        if session not in protected:
+            try:
+                claim = store.read_encrypted(store.session_path(session))
+                claimed = datetime.fromisoformat(claim["claimed_at"].replace("Z", "+00:00")) if claim else None
+                protected[session] = bool(claimed and (datetime.now(timezone.utc) - claimed).total_seconds() < 1800)
+            except (StateError, ValueError, TypeError, KeyError):
+                protected[session] = True
+        if protected[session]:
             continue
         try:
             store.backend.delete(f"responses/{base}", f"chore(state): drop stale qr {base}")
@@ -348,13 +513,28 @@ def cmd_control(store: StateStore, env: Mapping[str, str], *, qr_page_factory=No
         envelope = json.loads(instruction_text)
         secret_key = b64d(secret_text)
         instruction = control_mod.decode(envelope, secret_key)
-    except (ValueError, CryptoFailure) as exc:
+    except (ValueError, CryptoFailure, control_mod.ControlError) as exc:
         raise ConfigError(f"指令无法解封：{scrub(str(exc))}") from exc
+    if _env(env, "WXREAD_SESSION") and session != instruction.session_id:
+        raise ConfigError("workflow 的 session_id 与密文指令不一致")
+    session = instruction.session_id
+    try:
+        if len(b64d(instruction.reply_key)) != 32:
+            raise ConfigError("指令需要32字节回执公钥")
+    except CryptoFailure as exc:
+        raise ConfigError("指令回执公钥无效") from exc
     if getattr(instruction, "action", "") == "qr":
         dropped = purge_stale_qr(store, session)
         if dropped:
             log.info("清掉 %d 张旧二维码帧", dropped)
-    receipt = control_mod.execute(ctx, instruction, skew=int(_env(env, "WXREAD_SKEW", str(control_mod.DEFAULT_SKEW))))
+    received_at = store.backend.run_created_at(str(env["GITHUB_RUN_ID"])) if env.get("GITHUB_RUN_ID") else None
+    try:
+        receipt = control_mod.execute(
+            ctx, instruction, now=received_at, skew=int(_env(env, "WXREAD_SKEW", str(control_mod.DEFAULT_SKEW)))
+        )
+    except control_mod.ControlError as exc:
+        log.warning("指令被拒绝：%s", scrub(str(exc)))
+        return EXIT_ALL_FAILED
     log.info("回执：%s", control_mod.summary(receipt))
     print(f"::notice::control {control_mod.summary(receipt)}", flush=True)
     return EXIT_OK if receipt.get("ok") else EXIT_ALL_FAILED
@@ -362,7 +542,7 @@ def cmd_control(store: StateStore, env: Mapping[str, str], *, qr_page_factory=No
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="wxread.worker")
-    parser.add_argument("command", choices=("read", "warm", "migrate", "control"))
+    parser.add_argument("command", choices=("read", "warm", "migrate", "control", "plan", "report"))
     parser.add_argument("--verbose", action="store_true")
     return parser
 
@@ -384,6 +564,10 @@ def main(argv: list[str] | None = None, env: Mapping[str, str] | None = None) ->
             return cmd_migrate(store, env)
         if args.command == "read":
             return cmd_read(store, env)
+        if args.command == "plan":
+            return cmd_plan(store, env)
+        if args.command == "report":
+            return cmd_report(store, env)
         if args.command == "control":
             return cmd_control(store, env)
         return cmd_warm(store, env)

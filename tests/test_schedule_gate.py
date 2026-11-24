@@ -27,3 +27,18 @@ def test_cmd_read_exits_zero_when_disabled(store):
 def test_cmd_warm_exits_zero_when_warm_hours_zero(store):
     store.save_settings({"schedule": {"warm_hours": 0}})
     assert worker.cmd_warm(store, {}) == worker.EXIT_OK
+
+
+def test_manual_read_and_warm_bypass_the_automatic_switch(store):
+    store.save_settings({"schedule": {"enabled": False, "warm_hours": 0}})
+    assert worker.schedule_gate(store, "read", automatic=False) == ""
+    assert worker.schedule_gate(store, "warm", automatic=False) == ""
+
+
+def test_unsupported_time_is_rejected_instead_of_falsely_saved(store):
+    import pytest
+    from wxread import control
+
+    with pytest.raises(control.ControlError, match="cron"):
+        control.handle_schedule(control.ControlContext(store), {"daily": "02:30"})
+    assert "schedule" not in store.load_settings()

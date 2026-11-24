@@ -1,6 +1,7 @@
 """自动抓取阅读参数：`web/book/read` 的 POST body → 账户 read_payload。"""
 
 import json
+import pytest
 
 from wxread import capture, control
 from wxread.state import StateStore
@@ -57,17 +58,19 @@ def test_sniffer_takes_the_first_qualified_read_request():
 
 def test_sniffer_promotes_only_account_fields_and_drops_transport_headers():
     sniffer = capture.ReadSniffer()
-    sniffer.feed("https://weread.qq.com/web/book/readingProgress", "POST", READ_BODY, BROWSER_HEADERS)
+    sniffer.feed("https://weread.qq.com/web/book/read", "POST", READ_BODY, BROWSER_HEADERS)
     payload = sniffer.read_payload
     assert set(payload) == {"appId", "ps", "pc", "ci", "co", "sm", "pr", "b", "c"}
-    assert all(isinstance(value, str) for value in payload.values())
+    assert payload["ci"] == 27 and payload["co"] == 389 and payload["pr"] == 74
     assert "ts" not in payload
 
     headers = sniffer.headers
     assert headers["User-Agent"] == "Mozilla/5.0 Chrome/141"
     assert headers["accept"] == "application/json"
-    for dropped in ("Cookie", "Content-Type", "Origin", "Referer"):
+    for dropped in ("Cookie", "Content-Type"):
         assert dropped not in headers
+    assert headers["Origin"] == "https://weread.qq.com"
+    assert headers["Referer"] == BROWSER_HEADERS["Referer"]
 
 
 class QrOnlyPage:
@@ -132,7 +135,7 @@ def test_qr_without_capture_still_binds_and_flags_the_gap(store: StateStore):
     assert receipt["payload_captured"] is False
     stored = store.load_account(receipt["account_id"])
     assert stored["read_payload"] == {}
-    assert "ps/pc" in stored["note"]
+    assert "自动获取" in stored["note"]
 
 
 def test_capture_failure_does_not_break_the_binding(store: StateStore):
@@ -143,10 +146,82 @@ def test_capture_failure_does_not_break_the_binding(store: StateStore):
 
 def test_rebind_clears_the_stale_missing_payload_note(store: StateStore):
     first = control.handle_qr(make_ctx(store, QrOnlyPage()), {})
-    assert "ps/pc" in store.load_account(first["account_id"])["note"]
+    assert "自动获取" in store.load_account(first["account_id"])["note"]
 
     again = control.handle_qr(make_ctx(store, CapturingPage()), {})
     assert again["account_id"] == first["account_id"]
     stored = store.load_account(again["account_id"])
     assert stored["note"] == ""
     assert stored["read_payload"]["ps"] == "4ee326507a65a465g015fae"
+
+
+def test_qr_preserves_numeric_and_zero_fields(store: StateStore):
+    class ZeroOffsetPage(CapturingPage):
+        def capture_read_payload(self):
+            return capture.promoted(json.loads(READ_BODY) | {"co": 0, "pr": 0}), {}
+
+    receipt = control.handle_qr(make_ctx(store, ZeroOffsetPage()), {})
+    payload = store.load_account(receipt["account_id"])["read_payload"]
+    assert payload["ci"] == 27
+    assert payload["co"] == 0
+    assert payload["pr"] == 0
+
+
+def test_qr_saves_cookie_rotated_during_payload_capture(store: StateStore):
+    class RotatingPage(CapturingPage):
+        captured = False
+
+        def capture_read_payload(self):
+            self.captured = True
+            return super().capture_read_payload()
+
+        def cookies(self):
+            cookies = super().cookies()
+            if self.captured:
+                cookies["wr_skey"] = "rotated-after-login"
+            return cookies
+
+    receipt = control.handle_qr(make_ctx(store, RotatingPage()), {})
+    assert store.load_account(receipt["account_id"])["cookies"]["wr_skey"] == "rotated-after-login"
+
+
+def test_saved_cookie_capture_preserves_a_concurrent_new_login(store: StateStore):
+    from wxread.accounts import account_from_curl
+    from support import CURL_SAMPLE
+
+    account = account_from_curl(CURL_SAMPLE)
+    store.save_account(account)
+
+    class ReboundWhileCapturing(CapturingPage):
+        def capture_read_payload(self):
+            fresh = store.load_account(account.id)
+            fresh["cookies"]["wr_skey"] = "new-login-wins"
+            store.save_account(fresh)
+            return super().capture_read_payload()
+
+    with pytest.raises(control.ControlError, match="登录态已更新"):
+        control.handle_capture(make_ctx(store, ReboundWhileCapturing()), {"account_id": account.id})
+    assert store.load_account(account.id)["cookies"]["wr_skey"] == "new-login-wins"
+
+
+def test_incomplete_qr_account_can_be_renamed_and_disabled(store: StateStore):
+    ctx = make_ctx(store, QrOnlyPage())
+    receipt = control.handle_qr(ctx, {})
+    control.handle_update(ctx, {"account_id": receipt["account_id"], "label": "稍后补全", "enabled": False})
+    saved = store.load_account(receipt["account_id"])
+    assert saved["label"] == "稍后补全" and saved["enabled"] is False
+
+
+def test_read_capture_requires_a_successful_matching_response():
+    sniffer = capture.ReadSniffer()
+    sniffer.feed("https://weread.qq.com/web/book/read", "POST", READ_BODY, BROWSER_HEADERS)
+    assert sniffer.confirmed is False
+    assert sniffer.confirm_response("https://weread.qq.com/web/book/read", "POST", READ_BODY, BROWSER_HEADERS, {"succ": 0}) is False
+    assert sniffer.confirm_response("https://weread.qq.com/web/book/read", "POST", READ_BODY, BROWSER_HEADERS, {"succ": 1, "synckey": "valid"}) is True
+    assert sniffer.confirmed is True
+
+
+def test_progress_or_other_hosts_are_not_read_payload_proof():
+    sniffer = capture.ReadSniffer()
+    assert sniffer.feed("https://weread.qq.com/web/book/readingProgress", "POST", READ_BODY) is False
+    assert sniffer.feed("https://other.example/web/book/read", "POST", READ_BODY) is False

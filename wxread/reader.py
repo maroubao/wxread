@@ -6,13 +6,13 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
 import random
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Protocol
 from urllib.parse import quote
+from uuid import uuid4
 
 import requests
 
@@ -31,6 +31,12 @@ DEFAULT_PACE = 30.0
 DEFAULT_DEADLINE = 20 * 60
 MAX_BODY_BYTES = 64 * 1024
 BACKOFF = (5, 15, 45)
+
+
+def reading_deadline(account: Account, pace: float = DEFAULT_PACE, override: float | None = None) -> float:
+    if override is not None and override > 0:
+        return override
+    return max(DEFAULT_DEADLINE, account.target_count * (pace + DEFAULT_TIMEOUT) + 120)
 
 LEVELS = ("L0", "L1", "L2", "L3")
 SESSION_ERRCODES = (-2012, -2013)
@@ -113,6 +119,7 @@ class TransportResponse:
     status_code: int
     payload: dict[str, Any]
     set_cookies: dict[str, str] = field(default_factory=dict)
+    error: str = ""
 
 
 class Transport(Protocol):
@@ -139,23 +146,27 @@ class RequestsTransport:
         cookies: Mapping[str, str],
         headers: Mapping[str, str],
     ) -> TransportResponse:
+        jar = getattr(self.session, "cookies", None)
+        if jar is not None:
+            jar.clear()  # 请求凭据以账户字典为准，避免Session的旧域Cookie重复发送
         try:
             resp = self.session.post(
                 url, json=payload, headers=dict(headers), cookies=dict(cookies), timeout=self.timeout
             )
         except requests.RequestException as exc:
             raise TransportError(f"请求失败：{type(exc).__name__}") from exc
+        set_cookies = {k: v for k, v in resp.cookies.items()}
         if resp.status_code != 200:
-            raise TransportError(f"HTTP {resp.status_code}")
+            return TransportResponse(resp.status_code, {}, set_cookies, f"HTTP {resp.status_code}")
         if len(resp.content) > MAX_BODY_BYTES:
-            raise TransportError(f"响应体过大：{len(resp.content)} 字节")
+            return TransportResponse(200, {}, set_cookies, "响应体过大")
         try:
             data = resp.json()
-        except (ValueError, json.JSONDecodeError) as exc:
-            raise TransportError("响应不是合法 JSON") from exc
+        except ValueError:
+            return TransportResponse(200, {}, set_cookies, "响应不是合法 JSON")
         if not isinstance(data, dict):
-            raise TransportError("响应不是 JSON 对象")
-        return TransportResponse(200, data, {k: v for k, v in resp.cookies.items()})
+            return TransportResponse(200, {}, set_cookies, "响应不是 JSON 对象")
+        return TransportResponse(200, data, set_cookies)
 
 
 # ---------------------------------------------------------------- 结果
@@ -181,6 +192,7 @@ class Outcome:
 
     def as_run(self, account_id: str, started_at: str, finished_at: str) -> dict:
         return {
+            "run_id": uuid4().hex,
             "account_id": account_id,
             "started_at": started_at,
             "finished_at": finished_at,
@@ -202,21 +214,23 @@ class Reader:
         transport: Transport | None = None,
         *,
         pace: float = DEFAULT_PACE,
-        deadline: float = DEFAULT_DEADLINE,
+        deadline: float | None = None,
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.time,
         rand: random.Random | None = None,
         on_progress: Callable[[dict], None] | None = None,
+        on_cookies: Callable[[Account], None] | None = None,
         should_stop: Callable[[], bool] | None = None,
     ) -> None:
         self.account = account
         self.transport = transport or RequestsTransport()
         self.pace = max(0.0, float(pace))
-        self.deadline = float(deadline)
+        self.deadline = reading_deadline(account, self.pace, deadline)
         self.sleep = sleep
         self.clock = clock
         self.rand = rand or random.Random()
         self.on_progress = on_progress
+        self.on_cookies = on_cookies
         self.should_stop = should_stop or (lambda: False)
         self.last_read_at = int(clock())
 
@@ -226,21 +240,38 @@ class Reader:
         response = self.transport.post(url, payload, self.account.cookies, self.account.headers)
         if response.set_cookies:
             self.account.cookies.update(response.set_cookies)  # 关键：Set-Cookie 必须合并
+            if response.set_cookies.get("wr_skey"):
+                self.account.mark_renewed(response.set_cookies["wr_skey"])
+            if self.on_cookies:
+                self.on_cookies(self.account)
+        if response.error or response.status_code != 200:
+            raise TransportError(response.error or f"HTTP {response.status_code}")
         return response
 
     def renew(self) -> str:
         """renewal 拿完整 wr_skey（旧实现只取前 8 位）。"""
+        network_failures = 0
+        invalid_session = False
         for variant in COOKIE_VARIANTS:
             try:
                 response = self._post(RENEW_URL, dict(variant))
             except TransportError as exc:
+                network_failures += 1
                 log.warning("renewal 变体失败：%s", scrub(str(exc)))
                 continue
-            # 只认"本次响应新下发的" skey：沿用旧值会让过期会话假装续期成功
+            if response.payload.get("errcode", response.payload.get("errCode")) in SESSION_ERRCODES:
+                invalid_session = True
+                continue
             skey = (response.set_cookies or {}).get("wr_skey") or response.payload.get("wr_skey")
             if skey and str(skey).strip():
                 self.account.cookies["wr_skey"] = str(skey)
                 return str(skey)
+            if response.payload.get("succ") == 1 and self.account.cookies.get("wr_skey"):
+                return self.account.cookies["wr_skey"]
+        if invalid_session:
+            raise SessionInvalid("renewal 确认登录态失效")
+        if network_failures == len(COOKIE_VARIANTS):
+            raise TransportError("renewal 网络请求均失败")
         raise RenewalFailed("renewal 未返回 wr_skey")
 
     def fix_synckey(self, book_id: str) -> None:
@@ -266,12 +297,16 @@ class Reader:
         book_id = str(base.get("b") or "")
         started = self.clock()
         l1_streak = 0
-        renewed_for = ""
+        renewed_for: set[str] = set()
         fixed_book = False
+
+        if self.pace and not self.should_stop():
+            self.sleep(self.pace)
 
         while outcome.read_count < account.target_count:
             if self.should_stop():
-                outcome.raise_level("L2" if outcome.read_count else "L3", "cancelled")
+                outcome.raise_level("L2" if outcome.read_count else "L1", "cancelled")
+                outcome.reason = "cancelled"
                 break
             if self.clock() - started > self.deadline:
                 outcome.raise_level("L2", "deadline")
@@ -288,32 +323,35 @@ class Reader:
                 if l1_streak <= len(BACKOFF):
                     self.sleep(BACKOFF[l1_streak - 1])
                     continue
-                if renewed_for == "transport":
-                    outcome.raise_level("L3", "renew_failed")
+                if "transport" in renewed_for:
+                    outcome.raise_level("L2", "net")
                     break
                 try:
                     account.mark_renewed(self.renew())
-                except RenewalFailed:
+                except SessionInvalid:
                     outcome.raise_level("L3", "renew_failed")
                     break
+                except (RenewalFailed, TransportError):
+                    outcome.raise_level("L2", "renew_unavailable")
+                    break
                 outcome.renewals += 1
-                renewed_for = "transport"
+                renewed_for.add("transport")
                 l1_streak = 0
                 outcome.raise_level("L2", "net")
                 continue
 
             errcode = data.get("errcode", data.get("errCode"))
             if errcode in SESSION_ERRCODES:
-                if renewed_for == "session":
+                if "session" in renewed_for:
                     outcome.raise_level("L3", "renew_failed")
                     break
                 try:
                     account.mark_renewed(self.renew())
-                except RenewalFailed:
+                except ReadError:
                     outcome.raise_level("L3", "renew_failed")
                     break
                 outcome.renewals += 1
-                renewed_for = "session"
+                renewed_for.add("session")
                 outcome.raise_level("L2", f"err_{errcode}")
                 continue
 
@@ -321,7 +359,7 @@ class Reader:
             if data.get("succ") == 1 and synckey:
                 outcome.read_count += 1
                 l1_streak = 0
-                renewed_for = ""
+                renewed_for.clear()
                 self.last_read_at = int(self.clock())
                 account.mark_ok()
                 if self.on_progress:
@@ -342,18 +380,36 @@ class Reader:
                     self.fix_synckey(book_id)
                     fixed_book = True
                     continue
-                if renewed_for != "synckey":
+                if "synckey" not in renewed_for:
                     try:
                         account.mark_renewed(self.renew())
-                    except RenewalFailed:
+                    except TransportError:
+                        break
+                    except ReadError:
                         outcome.raise_level("L3", "renew_failed")
                         break
                     outcome.renewals += 1
-                    renewed_for = "synckey"
+                    renewed_for.add("synckey")
                     continue
                 outcome.raise_level("L3", "no_synckey")
                 break
 
+            outcome.raise_level("L2", "payload_invalid")
+            if not fixed_book and book_id:
+                self.fix_synckey(book_id)
+                fixed_book = True
+                continue
+            if "payload" not in renewed_for:
+                try:
+                    account.mark_renewed(self.renew())
+                except TransportError:
+                    break
+                except ReadError:
+                    outcome.raise_level("L3", "payload_invalid")
+                    break
+                outcome.renewals += 1
+                renewed_for.add("payload")
+                continue
             outcome.raise_level("L3", "payload_invalid")
             break
 
@@ -362,7 +418,7 @@ class Reader:
         if outcome.read_count == 0:
             outcome.exit_code = 3
             outcome.level = "L3" if outcome.level == "L0" else outcome.level
-        elif outcome.level == "L3":
+        elif outcome.level == "L3" or outcome.read_count < outcome.target_count:
             outcome.exit_code = 2
         else:
             outcome.exit_code = 0

@@ -17,8 +17,9 @@ import hashlib
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Protocol
+from urllib.parse import urljoin, urlparse
 
-from .accounts import Account, derive_account_id
+from .accounts import Account, derive_account_id, normalize_read_payload
 from .capture import BOOK_LINK_SELECTORS, SHELF_URL, ReadSniffer
 from .logsafe import mask
 
@@ -26,6 +27,7 @@ LOGIN_URL = "https://weread.qq.com/"
 DEFAULT_TIMEOUT = 600
 POLL_SECONDS = 3
 DEFAULT_REFRESH_AFTER = 85.0  # 微信读书二维码约 2 分钟过期，到期前整页重开换新码
+DEFAULT_CAPTURE_TIMEOUT = 180.0
 # 常见二维码载体：微信读书登录卡片里的 img/canvas，兜底整页截图
 LOGIN_TRIGGER = "a.wr_index_page_top_section_header_action_link"
 QR_SELECTORS = ("img.wr_login_modal_qr_img", "img[src^='data:image']", "canvas")
@@ -34,7 +36,7 @@ DEFAULT_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
 )
-PAYLOAD_HINT = "扫码账户未带 ps/pc，请导入一次 curl 或手动补全 read_payload"
+PAYLOAD_HINT = "登录已确认，阅读参数未取齐，重试自动获取"
 
 
 class QrError(RuntimeError):
@@ -91,32 +93,46 @@ class ChromeLoginPage:
     Actions 的 ubuntu-latest 预装 Google Chrome，本机也有，所以不下载 Playwright 自带浏览器。
     """
 
-    def __init__(self, headless: bool = True, viewport: tuple[int, int] = (900, 1100)):
+    def __init__(self, headless: bool = True, viewport: tuple[int, int] = (900, 1100), initial_cookies: Mapping[str, str] | None = None):
         self._headless = headless
         self._viewport = viewport
         self._pw = None
         self._browser = None
         self._page = None
         self._ua = DEFAULT_UA
+        self._initial_cookies = dict(initial_cookies or {})
+        self.capture_error = ""
 
     def open(self) -> None:
         from playwright.sync_api import sync_playwright  # 延迟导入：无浏览器环境也能 import 本模块
 
         self._pw = sync_playwright().start()
-        try:
-            self._browser = self._pw.chromium.launch(channel="chrome", headless=self._headless)
-        except Exception:  # CI 里只有 Playwright 自带 chromium 时退而用它
-            self._browser = self._pw.chromium.launch(headless=self._headless)
+        for channel in ("chrome", "msedge", None):
+            try:
+                options = {"headless": self._headless}
+                if channel:
+                    options["channel"] = channel
+                self._browser = self._pw.chromium.launch(**options)
+                break
+            except Exception:
+                if channel is None:
+                    raise
         context = self._browser.new_context(
             viewport={"width": self._viewport[0], "height": self._viewport[1]},
             device_scale_factor=SCREENSHOT_SCALE,
             locale="zh-CN",
         )
+        if self._initial_cookies:
+            context.add_cookies([
+                {"name": name, "value": str(value), "url": LOGIN_URL}
+                for name, value in self._initial_cookies.items() if value
+            ])
         self._page = context.new_page()
         self._page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=45_000)
         self._page.wait_for_timeout(1200)
         self._ua = self._page.evaluate("() => navigator.userAgent") or DEFAULT_UA
-        self._open_login_modal()
+        if not self._initial_cookies:
+            self._open_login_modal()
 
     def _open_login_modal(self) -> None:
         """微信读书把登录做成首页浮层：点右上角"登录"，二维码才出现。"""
@@ -237,74 +253,109 @@ class ChromeLoginPage:
         jar = self._page.context.cookies()
         return {item["name"]: item["value"] for item in jar if item.get("name")}
 
-    def capture_read_payload(self, timeout: float = 90.0) -> tuple[dict[str, str], dict[str, str]]:
-        """登录态下打开一本书，抓站点自己发的 `web/book/read`，返回 (read_payload, headers)。
-
-        抓不到就返回 ({}, {})，由调用方退回"提醒用户导入 curl"的旧路径。
-        """
+    def capture_read_payload(self, timeout: float = DEFAULT_CAPTURE_TIMEOUT) -> tuple[dict[str, Any], dict[str, str]]:
+        """进入可读正文，监听整个浏览器上下文并等待成功阅读响应。"""
         assert self._page is not None
         sniffer = ReadSniffer()
+        context = self._page.context
+        started = time.monotonic()
 
         def on_request(request: Any) -> None:
             try:
-                sniffer.feed(
-                    getattr(request, "url", ""),
-                    getattr(request, "method", ""),
-                    request.post_data,
-                    getattr(request, "headers", None),
-                )
-            except Exception:  # 抓包不能影响主流程
+                sniffer.feed(request.url, request.method, request.post_data, request.headers)
+            except Exception:
                 pass
 
-        self._page.on("request", on_request)
+        def on_response(response: Any) -> None:
+            try:
+                request = response.request
+                if response.status == 200 and "/web/book/read" in request.url:
+                    sniffer.confirm_response(request.url, request.method, request.post_data, request.headers, response.json())
+            except Exception:
+                pass
+
+        context.on("request", on_request)
+        context.on("response", on_response)
         try:
-            self._page.goto(SHELF_URL, wait_until="domcontentloaded", timeout=45_000)
+            self._page.goto(SHELF_URL, wait_until="domcontentloaded", timeout=30_000)
             self._page.wait_for_timeout(1500)
-            self._open_first_book()
-            deadline = time.monotonic() + max(5.0, timeout)
-            while not sniffer.ready and time.monotonic() < deadline:
-                self._page.wait_for_timeout(2000)
-                self._nudge_reader()
-            if not sniffer.ready:
+            candidates = self._reader_urls()
+            if not candidates:
+                self._page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=30_000)
+                self._page.wait_for_timeout(1500)
+                candidates = self._reader_urls()
+            if not candidates:
+                self.capture_error = "没有找到可打开的正文"
                 return {}, {}
-            return sniffer.read_payload, sniffer.headers
-        except Exception:
+            for url in candidates[:3]:
+                remaining = timeout - (time.monotonic() - started)
+                if remaining <= 0:
+                    break
+                if not self._open_first_book(url):
+                    continue
+                deadline = min(started + timeout, time.monotonic() + 90)
+                turns = 0
+                while not sniffer.confirmed and time.monotonic() < deadline:
+                    if turns < 3:
+                        self._nudge_reader()
+                        turns += 1
+                    self._page.wait_for_timeout(2000)
+                if sniffer.confirmed:
+                    self.capture_error = ""
+                    return sniffer.read_payload, sniffer.headers
+            self.capture_error = "阅读请求未得到成功确认，可以重试自动获取"
+            return {}, {}
+        except Exception as exc:
+            self.capture_error = f"正文加载失败（{type(exc).__name__}），可以重试自动获取"
             return {}, {}
         finally:
-            try:
-                self._page.remove_listener("request", on_request)
-            except Exception:
-                pass
+            for event, callback in (("request", on_request), ("response", on_response)):
+                try:
+                    context.remove_listener(event, callback)
+                except Exception:
+                    pass
 
-    def _open_first_book(self) -> bool:
-        """书架第一本书点进去；书架为空或还没渲染完就放弃。"""
+    def _reader_urls(self) -> list[str]:
         assert self._page is not None
+        urls = []
         for selector in BOOK_LINK_SELECTORS:
-            try:
-                link = self._page.query_selector(selector)
-            except Exception:
-                link = None
-            if not link:
-                continue
-            try:
-                link.click(timeout=6000)
-                self._page.wait_for_timeout(2500)
-                return True
-            except Exception:
-                continue
-        return False
+            for link in self._page.query_selector_all(selector):
+                href = link.get_attribute("href") or ""
+                url = urljoin(self._page.url, href)
+                parsed = urlparse(url)
+                if parsed.hostname == "weread.qq.com" and parsed.path.startswith("/web/reader/") and url not in urls:
+                    urls.append(url)
+        return urls
+
+    def _open_first_book(self, url: str | None = None) -> bool:
+        """直接导航到正文href，避免书卡内部的作者链接或新窗口。"""
+        assert self._page is not None
+        if not url:
+            urls = self._reader_urls()
+            url = urls[0] if urls else None
+        if not url:
+            return False
+        try:
+            self._page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+            self._page.wait_for_timeout(1500)
+            return True
+        except Exception:
+            return False
 
     def _nudge_reader(self) -> None:
-        """正文页每 60 秒才发一次心跳；翻页会立刻触发，用它把时间压到几秒。"""
+        """通过实际的下一页按钮进入正文，之后等待站点自己的阅读心跳。"""
         assert self._page is not None
-        for action in (
-            lambda: self._page.mouse.wheel(0, 900),
-            lambda: self._page.keyboard.press("PageDown"),
-        ):
-            try:
-                action()
-            except Exception:
-                pass
+        try:
+            next_page = self._page.get_by_role("button", name="下一页", exact=True)
+            if next_page.is_visible():
+                next_page.click(timeout=1500)
+                return
+        except Exception:
+            pass
+        try:
+            self._page.keyboard.press("ArrowRight")
+        except Exception:
+            pass
 
     def user_agent(self) -> str:
         return self._ua
@@ -384,7 +435,7 @@ def account_from_cookies(
     headers: Mapping[str, str] | None = None,
     label: str = "",
     target_count: int = 40,
-    payload: Mapping[str, str] | None = None,
+    payload: Mapping[str, Any] | None = None,
     now_iso: str = "",
 ) -> Account:
     """把扫码得到的 cookie 组装成 Account；缺 ps/pc 时留空并打 note 提示补全。"""
@@ -393,7 +444,7 @@ def account_from_cookies(
         label=label,
         cookies={k: v for k, v in cookies.items() if k in {"wr_vid", "wr_skey", "pac_uid"} or k.startswith("wr_")},
         headers=dict(headers or {}),
-        read_payload={k: str(v) for k, v in (payload or {}).items() if v},
+        read_payload=normalize_read_payload({k: v for k, v in (payload or {}).items() if v is not None and str(v).strip()}),
         target_count=target_count,
         enabled=True,
         status="ok",

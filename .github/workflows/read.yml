@@ -1,52 +1,101 @@
 name: read
+run-name: "read ${{ inputs.request_id || github.run_id }}"
 
-# 每天北京 01:07 读一轮（UTC 17:07）；手动触发用于临时补读。
+# 北京01:07，UTC17:07。手动触发可补跑指定账户。
 on:
   schedule:
     - cron: "7 17 * * *"
   workflow_dispatch:
     inputs:
       pace:
-        description: "两次阅读间隔秒数（默认 30）"
-        required: false
+        description: "读取间隔秒数（默认30）"
         default: "30"
+        type: string
       deadline:
-        description: "单账户最长秒数（默认 1200）"
+        description: "单账户截止秒数（0按目标和网络超时计算）"
+        default: "0"
+        type: string
+      account_ids:
+        description: "账户id，逗号分隔；留空运行全部"
         required: false
-        default: "1200"
+        type: string
+      request_id:
+        description: "页面跟踪id"
+        required: false
+        type: string
 
-# 阅读与保活互不抢占：同一时刻只跑一个 read
 concurrency:
-  group: wxread-read
+  group: wxread-session
   cancel-in-progress: false
 
 permissions:
-  contents: write # 进度、cookie、运行记录都写状态分支
+  contents: write
+
+env:
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  WXREAD_STATE_KEY: ${{ secrets.WXREAD_STATE_KEY }}
+  WXREAD_STATE_BRANCH: ${{ vars.WXREAD_STATE_BRANCH || 'wxread-state' }}
+  WXREAD_PACE: ${{ inputs.pace }}
+  WXREAD_DEADLINE: ${{ inputs.deadline }}
+  WXREAD_BATCH_ID: ${{ github.run_id }}
+  WXREAD_CURL_BASH: ${{ secrets.WXREAD_CURL_BASH }}
+  WXREAD_ACCOUNTS_JSON: ${{ secrets.WXREAD_ACCOUNTS_JSON }}
+  FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
 
 jobs:
-  read:
-    name: read
+  plan:
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      count: ${{ steps.plan.outputs.count }}
+      allowed: ${{ steps.plan.outputs.allowed }}
     steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
-
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: pip
-
-      - name: 安装依赖
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-      - name: 读取
+      - run: pip install -r requirements.txt
+      - id: plan
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          WXREAD_STATE_KEY: ${{ secrets.WXREAD_STATE_KEY }}
-          WXREAD_PACE: ${{ github.event.inputs.pace }}
-          WXREAD_DEADLINE: ${{ github.event.inputs.deadline }}
+          WXREAD_ACCOUNT_IDS: ${{ inputs.account_ids }}
+        run: python -m wxread.worker plan
+
+  read:
+    needs: plan
+    if: ${{ needs.plan.outputs.count != '0' }}
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: ${{ matrix.timeout_minutes }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: 读取并回写
+        env:
+          WXREAD_ACCOUNT_IDS: ${{ matrix.account_ids }}
+          WXREAD_REPORT_MODE: defer
         run: python -m wxread.worker read
+
+  report:
+    needs: [plan, read]
+    if: ${{ always() && needs.plan.outputs.allowed == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: 发送本批飞书摘要
+        env:
+          WXREAD_ACCOUNT_IDS: ${{ inputs.account_ids }}
+        run: python -m wxread.worker report

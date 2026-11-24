@@ -1,70 +1,46 @@
-# wxread · 微信读书自动阅读（多账户 · 加密状态 · 零服务器）
+# wxread · 微信读书自动阅读
 
-每天北京时间 **01:07** 自动读一轮，每 6 小时保活一次会话。所有 cookie 与口令以密文存放在独立的
-`wxread-state` 分支，仓库里没有明文凭据。控制台是纯静态页面，不需要服务器、不需要构建。
+GitHub Actions 每天北京时间 **01:07** 阅读，每 6 小时续期；GitHub Pages 提供控制台。首次配置并扫码后可以关闭浏览器和本机，阅读结束通过飞书发送每日摘要。
 
-```
-read.yml   每天 01:07  ─┐
-warm.yml   每 6 小时   ─┼─> worker ──> wxread-state 分支（密文）
-control.yml  手动/页面 ─┘                 accounts/ settings/ runs/ responses/
-```
+- **无需 cURL**：微信扫码确认后自动进入正文并获取已验证的阅读参数；已有登录态支持自动重新取参。
+- **每日飞书摘要**：成功和未完成都汇总，多账户分片结束后发送一次；支持机器人签名。邮件、PushPlus、Telegram 可作异常提醒。
+- **可用控制台**：桌面总览/账户/记录/右栏，手机卡片；扫码、编辑、停用、运行、停止、四渠道配置均在页面操作。
+- **多账户和加密状态**：独立 wxread-state 分支，CAS 保留并发编辑，记录幂等、异常隔离、进度保存。
 
-## 特性
+默认 40 次成功请求按 30 秒折算为目标 20 分钟；云端执行需要约 20 分钟加启动和网络时间。微信读书要求重新确认登录时仍需手机扫码，GitHub 调度可能延迟。
 
-- **多账户**：每个微信读书账号一份 `accounts/<sha256(uid)[:12]>.enc.json`，互不影响；一个号过期只跳它自己。
-- **加密状态**：`crypto_secretbox`（XSalsa20-Poly1305）+ 明文上下文前缀 `wxread-state|<owner>/<repo>|v<kv>`，跨仓库/跨版本搬运直接解密失败。
-- **密文指令**：浏览器里用公钥封指令（`nacl.box`，临时密钥 + 显式 nonce），worker 解封后执行；回执用一次性 `reply_key` 加密回传。
-- **四级失败处理**：L1 退避重试（5/15/45s）→ L2 强制 renewal 补救 → L3 置 `needs_login` + 通知；不会静默失败。
-- **扫码登录**：不用手抄 cookie，也不用复制 cURL。控制台点"扫码添加账户"，Actions 里用 Playwright 打开微信读书登录浮层，二维码写入状态分支后页面轮询显示（每 85 秒自动换码）。扫码成功并确认后，worker 顺手打开书架读一段，把站点自己的 `web/book/read` 请求抓下来（`appId/ps/pc` 一次到位），面板自动收起、账户直接出现在表里。
-- **通知四选**：邮件（SMTP）、PushPlus、飞书 webhook、Telegram；口令写在加密的 `settings.enc.json` 里。
-- **零构建前端**：`web/` 只有 HTML + CSS + ES module，vendored tweetnacl，离线可用，Lighthouse a11y ≥ 90。
+## 开始使用
 
-## 快速开始
+完整的自助说明是 **[使用手册](docs/RUNBOOK.md)**，按「GitHub 配置 → 扫码绑定 → 飞书测试 → 阅读验收」顺序操作，包含页面所有功能、报错处理、升级和回滚。
 
-1. 建状态密钥并写进 Secret `WXREAD_STATE_KEY`：
+已经部署的用户升级代码时保留账户、状态分支和原密钥，按 **[维护手册](docs/MAINTENANCE.md)** 操作，不重新生成密钥或初始化账户。
 
-   ```bash
-   python -c "import os,base64;print(base64.b64encode(os.urandom(32)).decode())"
-   ```
+本仓库站点：[阅读控制台](https://maroubao.github.io/wxread/)。Fork 后用自己 Settings → Pages 中的地址，并连接自己的 owner/repo。
 
-2. 本机 `python scripts/keygen.py` 生成密钥对，私钥存进 Secret `WXREAD_CONTROL_SK`；再跑一次 `control.yml`（`control = init`）并填入输出的 `public_key`。
-3. Settings → Pages → Source 选 **GitHub Actions**；打开部署好的页面，填仓库 / token / 状态密钥 → 连接。
-4. 点"扫码添加账户"→ 微信扫码。扫完 worker 会在同一浏览器里读一段书，自动抓回 `appId/ps/pc`，不用再碰 cURL；只有回执 `payload_captured=false` 时，才去"导入 cURL"补一次。
-5. 点"立即运行"验证一次，之后交给定时任务。
+## 给维护者
 
-完整步骤、Secrets 清单、故障处置与上线验收清单见 **[docs/RUNBOOK.md](docs/RUNBOOK.md)**。
+先读 **[AGENTS.md](AGENTS.md)** 与 [文档索引](docs/README.md)。当前架构见 [ARCHITECTURE.md](docs/ARCHITECTURE.md)，页面依据见 [DESIGN.md](docs/DESIGN.md)。原始 PLAN 和旧阶段评审保留为历史来源，当前三个核心要求及使用手册优先。
+
+~~~powershell
+python -m pip install -r requirements-dev.txt
+python -m pytest tests -q
+python -m pyflakes wxread scripts tests conftest.py
+python scripts/scan_secrets.py
+node --test tests/js/*.test.mjs
+git diff --check
+~~~
+
+具体环境、完整检查、真实浏览器/微信/GitHub 验收、依赖升级和回滚见维护手册。验证范围与本轮修复记录见 [G2-repair.md](docs/reviews/G2-repair.md)；替身测试不能代替真实外部服务验收。
 
 ## 目录
 
-| 路径 | 内容 |
+| 路径 | 用途 |
 | --- | --- |
-| `wxread/` | 运行时：`crypto` `state` `accounts` `reader` `jobs` `worker` `qr` `control` `notify` `warm` `logsafe` |
-| `web/` | 控制台（零构建）：`index.html` `app.js` `crypto.js` `gh.js` `style.css` |
-| `docs/` | `ARCHITECTURE.md` `THREAT-MODEL.md` `DESIGN.md` `RUNBOOK.md` `REVIEW.md` `design/` `reviews/` |
-| `tests/` | pytest（104 个）+ `tests/js/` 跨语言加密互通测试（4 个） |
-| `.github/workflows/` | `read.yml` `warm.yml` `control.yml` `tests.yml` `pages.yml` |
+| wxread/ | 协议、账户、加密状态、控制、作业、通知与 worker |
+| web/ | 原生 HTML/CSS/ES module 控制台，无构建 |
+| .github/workflows/ | read、warm、control、tests、pages |
+| docs/ | 使用、维护、架构、视觉、历史方案与验收资料 |
+| tests/ | Python 回归、Node 加密互通/配置/统计回归 |
+| requirements*.txt | 固定运行、浏览器和开发依赖 |
 
-## 本地开发
-
-```bash
-pip install -r requirements.txt pytest
-python -m pytest tests -q                 # 104 passed
-node --test tests/js/crypto.test.mjs      # 4 passed
-python scripts/scan_secrets.py            # 明文密钥扫描（CI 同款）
-python scripts/qr_local.py --wait 300     # 本机真扫码，写 .qr-cookies.json（已 gitignore）
-python scripts/control_local.py --help    # 本机下发密文指令：import curl / 通知口令
-```
-
-## 与旧版（v3）的差异
-
-| 旧 | 新 |
-| --- | --- |
-| `main.py` 单文件 + `config.py` 硬编码 | `wxread/` 包，依赖方向 `worker → jobs → reader → state → crypto` |
-| cookie 明文在 Secret 里，`wr_skey[:8]` 截断 | cookie 只在密文状态里，完整 `wr_skey` |
-| 通知走 `push.py`（含 WxPusher / ServerChan） | 只留邮件 / PushPlus / 飞书 / Telegram |
-| 每天 01:00 一次，失败了只发消息 | 01:07 + 每 6 小时保活；L1→L2→L3 分级处置 |
-| Docker / 本地 crontab 也能跑 | 只支持 GitHub Actions（Dockerfile 已删除） |
-
-## 免责
-
-本项目只操作自己的账号，用于在阅读挑战赛中保持天数。接口是微信读书网页端的公开接口，行为等同于浏览器里手动翻页。请自行评估账号风险。
+只操作自己拥有的微信读书账号。项目依赖网页端接口，维护者应关注真实接口与登录流程变更。

@@ -1,650 +1,900 @@
-// 控制台前端：零构建，直连 GitHub REST。
-// 明文（cookie、口令）只在浏览器与 worker 之间以密文流动；localStorage 只放 token 与本机状态密钥。
+// 原生控制台，所有管理指令在浏览器加密后直连GitHub。
+import * as gh from "./gh.js?v=5";
+import * as c from "./crypto.js?v=5";
+import * as vm from "./view-model.js?v=5";
 
-import * as gh from "./gh.js";
-import * as c from "./crypto.js";
-
-const $ = (id) => document.getElementById(id);
-
+const $ = id => document.getElementById(id);
 const state = {
-  cfg: gh.readConfig(),
-  stateKey: null,
-  publicKey: null,
-  keyVersion: 1,
-  accounts: [],
-  runs: [],
-  sessions: new Map(), // session_id -> 回执私钥
-  pollTimer: null,
-  qrShots: 0,
-  qrSession: null,
+  cfg: gh.readConfig(), key: null, publicKey: null, keyVersion: 1,
+  accounts: [], runs: [], settings: {}, status: "idle", epoch: 0,
+  controller: null, refreshTimer: null, refreshing: false, syncedAt: 0, revision: null,
+  cache: new Map(), sessions: new Map(), tracks: new Map(),
+  accountActions: new Set(),
+  qrSession: null, qrAttempt: null, qrPolling: null, qrUrl: null, askingQr: false,
+  editId: null, deleteId: null, expiresAt: 0,
 };
-
-// 二维码轮询预算：control.yml 冷启动要装依赖、装浏览器，1–2 分钟才出第一张码；
-// 码本身 ~85 秒换一张，所以按时间预算（而不是次数）轮询，够撑到扫完。
+const accountRows = new Map();
+const recordRows = new Map();
+const chartColumns = new Map();
 const QR_POLL_MS = 4000;
 const QR_BUDGET_MS = 15 * 60 * 1000;
 const RECEIPT_POLL_MS = 3000;
-const RECEIPT_TRIES = 100; // 5 分钟：够 control.yml 启动 + 二维码登录窗口
+const RECEIPT_BUDGET_MS = 15 * 60 * 1000;
 const RUN_POLL_MS = 5000;
+const RUN_BUDGET_MS = 7 * 60 * 60 * 1000;
+const CHANNEL_NAMES = { email: "邮件", pushplus: "PushPlus", feishu: "飞书", telegram: "Telegram" };
+let toastTimer = null;
 
-// ---------------------------------------------------------------- 小工具
-
-function say(text, kind = "") {
+function putText(element, value) {
+  const text = String(value == null ? "" : value);
+  if (element.textContent !== text) element.textContent = text;
+}
+function say(message, kind = "") {
   const box = $("status-message");
-  box.textContent = text;
-  if (kind) box.dataset.kind = kind;
-  else delete box.dataset.kind;
+  putText(box, message);
+  box.dataset.kind = kind;
+  box.hidden = false;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { box.hidden = true; }, 3000);
 }
-
-function fmtTime(iso) {
-  if (!iso) return "—";
-  const date = new Date(iso);
-  if (Number.isNaN(date.getTime())) return iso;
-  return date.toLocaleString("zh-CN", { hour12: false, month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
+function aborted() { return new DOMException("连接已结束", "AbortError"); }
+function current(epoch) { return epoch === state.epoch && !state.controller?.signal.aborted; }
+function check(epoch) { if (!current(epoch)) throw aborted(); }
+function delay(ms, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) { reject(aborted()); return; }
+    const abort = () => { clearTimeout(timer); reject(aborted()); };
+    const timer = setTimeout(() => { signal?.removeEventListener("abort", abort); resolve(); }, ms);
+    signal?.addEventListener("abort", abort, { once: true });
+  });
 }
-
-function esc(text) {
-  return String(text == null ? "" : text).replace(/[&<>"']/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[ch]);
+function showDialog(id) {
+  const dialog = $(id);
+  if (!dialog.open) dialog.showModal();
 }
-
-function contextFor() {
-  return c.CONTEXT_TEMPLATE(state.cfg.repo, state.keyVersion);
+function closeDialog(id) { if ($(id).open) $(id).close(); }
+function releaseQrImage() {
+  if (state.qrUrl) URL.revokeObjectURL(state.qrUrl);
+  state.qrUrl = null;
 }
-
-function newSessionId() {
-  return (crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`).replace(/-/g, "").slice(0, 24);
+function endSession(id) {
+  const session = state.sessions.get(id);
+  if (session) session.secret.fill(0);
+  state.sessions.delete(id);
 }
-
-// ---------------------------------------------------------------- 连接
-
-async function connect() {
+function stopConnection(preserveQr = false) {
+  state.epoch += 1;
+  state.controller?.abort();
+  clearInterval(state.refreshTimer);
+  state.refreshTimer = null;
+  for (const id of state.sessions.keys()) endSession(id);
+  state.tracks.clear();
+  state.accountActions.clear();
+  state.cache.clear();
+  state.qrSession = null;
+  state.qrAttempt = null;
+  state.qrPolling = null;
+  state.askingQr = false;
+  state.refreshing = false;
+  releaseQrImage();
+  if (!preserveQr) try { sessionStorage.removeItem("wxread.qr.v2"); } catch { /* 私密模式 */ }
+}
+function forget() {
+  stopConnection();
+  state.key?.fill(0);
+  state.key = null;
+  state.publicKey = null;
+  state.cfg = { repo: "", token: "", branch: "wxread-state" };
+  state.accounts = [];
+  state.runs = [];
+  state.settings = {};
+  state.status = "idle";
+  state.syncedAt = 0;
+  state.revision = null;
+  state.expiresAt = 0;
+  gh.clearConfig();
+  for (const input of document.querySelectorAll('input[type="password"]')) input.value = "";
+  $("inp-remember").checked = false;
+  showQrPanel(false);
+  renderAll();
+  say("已断开并清除本机凭据。");
+}
+function updateConnection() {
+  let kind = "", text = "未连接";
+  if (state.status === "connecting") { kind = "warn"; text = "连接中"; }
+  if (state.status === "error") { kind = "bad"; text = "连接失败"; }
+  if (state.status === "connected") {
+    const age = Date.now() - state.syncedAt;
+    kind = age > 120000 ? "bad" : age > 30000 ? "warn" : "ok";
+    text = age > 120000 ? "连接中断" : age > 30000 ? "连接中断，重试中" : state.cfg.repo;
+  }
+  $("conn-dot").className = "dot " + kind;
+  putText($("conn-text"), text);
+}
+function updateButtons() {
+  const connected = state.status === "connected";
+  $("btn-refresh").disabled = !connected || state.refreshing;
+  $("btn-qr").disabled = !connected || !state.publicKey || state.askingQr;
+  $("btn-run").disabled = connected && state.tracks.has("read.yml");
+  putText($("btn-run"), connected ? state.tracks.has("read.yml") ? "运行中" : "运行全部" : "连接仓库");
+  putText($("btn-config"), connected ? "连接设置" : "连接仓库");
+  $("btn-stop").disabled = !connected || (!state.tracks.has("read.yml") && !state.accounts.some(account => account.progress?.status === "running"));
+  $("btn-connect").disabled = state.status === "connecting";
+}
+async function connect(restoring = false) {
   const repo = $("inp-repo").value.trim();
   const token = $("inp-token").value.trim();
-  const keyText = $("inp-statekey").value.trim();
+  const stateKeyText = $("inp-statekey").value.trim();
   const branch = $("inp-branch").value.trim() || "wxread-state";
-  if (!repo || !token) {
-    say("仓库与 token 都要填。", "bad");
-    return;
-  }
-  gh.saveConfig({ repo, token, branch });
-  state.cfg = { repo, token, branch };
-  try {
-    state.qrSession = sessionStorage.getItem("wxread.qrSession") || null;
-    const qrSecret = sessionStorage.getItem("wxread.qrReplyKey");
-    if (state.qrSession && qrSecret) state.sessions.set(state.qrSession, c.b64d(qrSecret));
-  } catch (error) {
-    state.qrSession = null;
-  }
-  if (keyText) {
-    try {
-      state.stateKey = c.stateKeyFromBase64(keyText);
-      localStorage.setItem("wxread.statekey", keyText);
-    } catch (error) {
-      say(`状态密钥不对：${error.message}`, "bad");
-      return;
-    }
-  }
-  say("连接中…");
+  if (!/^[\w.-]+\/[\w.-]+$/.test(repo)) throw new Error("仓库填写 owner/repo。");
+  if (!token || !stateKeyText) throw new Error("填入token和状态密钥后连接。");
+  const key = c.stateKeyFromBase64(stateKeyText);
+  const previousExpiry = restoring ? Number(state.cfg.expiresAt) || 0 : 0;
+  stopConnection(true);
+  state.key?.fill(0);
+  gh.resetTokenExpiry();
+  state.controller = new AbortController();
+  state.cfg = { repo, token, branch, signal: state.controller.signal };
+  state.key = key;
+  state.publicKey = null;
+  state.accounts = [];
+  state.runs = [];
+  state.settings = {};
+  state.revision = null;
+  state.status = "connecting";
+  $("connect-error").hidden = true;
+  renderAll();
+  const epoch = state.epoch;
   try {
     const control = await gh.getJson(state.cfg, "control.json");
-    if (control && control.public_key) {
-      state.publicKey = c.b64d(control.public_key);
-      state.keyVersion = Number(control.key_version || 1);
-    }
-    $("conn-dot").className = "dot ok";
-    $("conn-text").textContent = repo;
-    await refreshAll();
-    const base = state.publicKey ? "已连接。" : "已连接，但还没有指令公钥：先跑一次 control.yml（control=init）。";
-    say(base + expiryNote(), state.publicKey ? "ok" : "warn");
-    if (state.qrSession) {
-      // 刷新前正在扫码：把那一块放出来接着看，别让用户以为丢了
-      showQrPanel(true);
-      $("qr-hint").textContent = "接着上一次的扫码会话…";
-      pollQr().catch(() => {});
-    }
-  } catch (error) {
-    $("conn-dot").className = "dot bad";
-    $("conn-text").textContent = "连接失败";
-    const hint =
-      error.status === 401
-        ? "（token 过期或权限不足：去 GitHub 重新生成 fine-grained token，只需 contents + actions 写）"
-        : error.status === 404
-          ? "（仓库名写错，或状态分支上还没有 control.json）"
-          : "";
-    say(`连接失败：${error.message}${hint}`, "bad");
-  }
-}
-
-// token 到期提醒：GitHub 在响应头里给了到期时间就用它，没给就不显示。
-function expiryNote() {
-  const raw = typeof gh.getTokenExpiry === "function" ? gh.getTokenExpiry() : null;
-  if (!raw) return "";
-  const at = new Date(raw);
-  if (Number.isNaN(at.getTime())) return "";
-  const days = Math.floor((at.getTime() - Date.now()) / 86400000);
-  const text = at.toISOString().slice(0, 10);
-  if (days < 0) return ` token 已于 ${text} 过期，自动任务不受影响，网页需要重新填一个新 token。`;
-  if (days <= 14) return ` token 还有 ${days} 天到期（${text}）。`;
-  return ` token 有效至 ${text}。`;
-}
-
-function forget() {
-  for (const key of ["wxread.repo", "wxread.token", "wxread.branch", "wxread.statekey"]) localStorage.removeItem(key);
-  state.cfg = { repo: "", token: "", branch: "wxread-state" };
-  state.stateKey = null;
-  state.publicKey = null;
-  $("inp-token").value = "";
-  $("inp-statekey").value = "";
-  $("conn-dot").className = "dot";
-  $("conn-text").textContent = "未连接";
-  say("已清除本机凭据（状态分支上的密文不受影响）。");
-}
-
-// ---------------------------------------------------------------- 读数据
-
-async function loadAccounts() {
-  const dir = await gh.listDir(state.cfg, "accounts");
-  const out = [];
-  for (const entry of dir) {
-    if (!entry.name.endsWith(".enc.json")) continue;
-    const envelope = await gh.getFile(state.cfg, `accounts/${entry.name}`);
-    if (!envelope) continue;
+    check(epoch);
+    if (!control?.public_key) throw new Error("状态分支尚未初始化，先运行control.yml的init。");
+    state.publicKey = c.b64d(control.public_key);
+    if (state.publicKey.length !== 32) throw new Error("指令公钥无效。");
+    state.keyVersion = Number(control.key_version || 1);
+    await refreshAll(true);
+    check(epoch);
+    state.status = "connected";
     try {
-      const payload = c.decryptState(JSON.parse(new TextDecoder().decode(envelope.bytes)), state.stateKey, contextFor());
-      out.push(payload);
+      if (!restoring) gh.saveConfig({ repo, token, branch, stateKeyText }, $("inp-remember").checked);
+      state.expiresAt = restoring ? previousExpiry : $("inp-remember").checked ? Date.now() + gh.REMEMBER_MS : 0;
+    } catch {
+      $("inp-remember").checked = false;
+      state.expiresAt = 0;
+      say("已连接，浏览器存储不可用，本次页面有效。", "warn");
+    }
+    closeDialog("connect-dialog");
+    state.refreshTimer = setInterval(() => refreshAll().catch(reportError), 20000);
+    restoreQrSession();
+    renderAll();
+    say("已连接，账户状态已同步。", "ok");
+  } catch (error) {
+    if (!current(epoch)) return;
+    state.status = "error";
+    putText($("connect-error"), error.message);
+    $("connect-error").hidden = false;
+    showDialog("connect-dialog");
+    renderAll();
+    throw error;
+  }
+}
+async function encryptedFile(cfg, key, path) {
+  const epoch = state.epoch;
+  const file = await gh.getFile(cfg, path);
+  check(epoch);
+  if (!file) return null;
+  const cacheKey = cfg.repo + "|" + cfg.branch + "|" + path;
+  const cached = state.cache.get(cacheKey);
+  if (cached?.sha === file.sha) return cached.value;
+  const envelope = JSON.parse(new TextDecoder().decode(file.bytes));
+  const value = c.decryptState(envelope, key, c.CONTEXT_TEMPLATE(cfg.repo, Number(envelope.kv || state.keyVersion)));
+  state.cache.set(cacheKey, { sha: file.sha, value });
+  return value;
+}
+async function loadAccounts(cfg, key) {
+  const files = await gh.listDir(cfg, "accounts");
+  const accounts = await Promise.all(files.filter(file => file.name.endsWith(".enc.json")).map(async file => {
+    const id = file.name.slice(0, -9);
+    try {
+      const value = await encryptedFile(cfg, key, "accounts/" + file.name);
+      if (!value || Array.isArray(value) || typeof value !== "object" || !value.cookies || (value.id && value.id !== id)) throw new Error("账户数据不完整");
+      return { ...value, id };
     } catch (error) {
-      out.push({ id: entry.name.replace(".enc.json", ""), label: "（解不开）", status: "bad", note: error.message });
+      if (error.name === "AbortError") throw error;
+      return { id, label: "无法读取", status: "bad", note: error.message, enabled: false };
+    }
+  }));
+  return accounts.sort((left, right) => String(left.id).localeCompare(String(right.id)));
+}
+async function loadRuns(cfg, key) {
+  const months = vm.stateMonths();
+  const parts = await Promise.all(months.map(month => encryptedFile(cfg, key, "runs/" + month + ".enc.json")));
+  return vm.sortRuns(parts.flatMap(part => Array.isArray(part?.runs) ? part.runs : []));
+}
+async function refreshAll(force = false) {
+  if (!state.key || !state.cfg.token || state.refreshing) return;
+  const epoch = state.epoch, cfg = state.cfg, key = state.key;
+  state.refreshing = true;
+  updateButtons();
+  try {
+    const revision = await gh.latestBranchCommit(cfg);
+    check(epoch);
+    if (!force && revision && revision === state.revision) {
+      state.syncedAt = Date.now();
+      updateConnection();
+      return;
+    }
+    const [accounts, runs, settings] = await Promise.all([
+      loadAccounts(cfg, key), loadRuns(cfg, key), encryptedFile(cfg, key, "settings.enc.json"),
+    ]);
+    check(epoch);
+    if (accounts.length && accounts.every(account => account.status === "bad")) throw new Error("账户无法解密，检查状态密钥和密钥版本。");
+    state.accounts = accounts;
+    state.runs = runs;
+    state.settings = settings || {};
+    state.syncedAt = Date.now();
+    state.revision = revision;
+    if (state.status !== "error") state.status = "connected";
+    renderAll();
+  } finally {
+    if (epoch === state.epoch) {
+      state.refreshing = false;
+      updateButtons();
     }
   }
-  return out.sort((a, b) => String(a.id).localeCompare(String(b.id)));
 }
-
-async function loadRuns() {
-  const month = new Date().toISOString().slice(0, 7);
-  const file = await gh.getFile(state.cfg, `runs/${month}.enc.json`);
-  if (!file) return [];
-  try {
-    const payload = c.decryptState(JSON.parse(new TextDecoder().decode(file.bytes)), state.stateKey, contextFor());
-    return Array.isArray(payload.runs) ? payload.runs : [];
-  } catch (error) {
-    say(`运行记录解不开：${error.message}`, "warn");
-    return [];
+function rowStatus(account) {
+  if (account.status === "bad") return ["bad", "无法读取", "none"];
+  if (account.enabled === false) return ["neutral", "已停用", "none"];
+  if (!vm.payloadReady(account) || ["payload_invalid", "no_synckey"].includes(account.note)) return ["warn", "参数待准备", "capture"];
+  if (account.status === "needs_login") return ["warn", "需重新绑定", "rebind"];
+  if (account.progress?.status === "running") {
+    return ["run", "运行中 " + Math.min(100, Math.round(100 * vm.count(account.progress.read_count) / vm.targetCount(account))) + "%", "stop"];
   }
+  return ["ok", "正常", "run"];
 }
-
-// ---------------------------------------------------------------- 渲染
-
-function renderMetrics(runs) {
-  const today = new Date().toISOString().slice(0, 10);
-  const todays = runs.filter((run) => String(run.at || run.started_at || "").startsWith(today));
-  const reads = todays.reduce((sum, run) => sum + Number(run.read_count || 0), 0);
-  const ok = state.accounts.filter((a) => a.enabled !== false && a.status === "ok");
-  const needs = state.accounts.filter((a) => a.status === "needs_login");
-  const last = runs.length ? runs[runs.length - 1] : null;
-
-  $("m-read").textContent = String(reads);
-  $("m-read-hint").textContent = `目标 ${ok.reduce((sum, a) => sum + Number(a.target_count || 40), 0)} 次`;
-  $("m-accounts").textContent = String(ok.length);
-  $("m-accounts-hint").textContent = `共 ${state.accounts.length} 个账户`;
-  $("m-last").textContent = last ? String(last.read_count || 0) : "—";
-  $("m-last-hint").textContent = last ? `${fmtTime(last.at || last.started_at)} · ${last.reason || "ok"}` : "还没有运行记录";
-  $("m-needs").textContent = String(needs.length);
-}
-
-function badge(status) {
-  const map = { ok: ["ok", "正常"], needs_login: ["warn", "需要登录"], stopped: ["bad", "已停用"] };
-  const [kind, text] = map[status] || ["run", status || "未知"];
-  return `<span class="badge ${kind}">${esc(text)}</span>`;
-}
-
-function renderAccounts() {
-  const body = $("acc-body");
-  $("acc-count").textContent = state.accounts.length ? `${state.accounts.length} 个` : "";
-  if (!state.accounts.length) {
-    body.innerHTML = '<tr><td colspan="5" class="sub">还没有账户：先扫码或导入 curl。</td></tr>';
-    return;
+function renderAccounts(data) {
+  const tbody = $("acc-body");
+  const ids = new Set(state.accounts.map(account => String(account.id)));
+  for (const [id, row] of accountRows) {
+    if (!ids.has(id)) {
+      const focused = row.contains(document.activeElement);
+      row.remove();
+      accountRows.delete(id);
+      if (focused) $("btn-qr").focus();
+    }
   }
-  body.innerHTML = state.accounts
-    .map(
-      (a) => `<tr>
-        <td><div>${esc(a.label || a.id)}</div><div class="sub">${esc(a.id)}${a.note ? ` · ${esc(a.note)}` : ""}</div></td>
-        <td>${badge(a.status)}</td>
-        <td class="num">${esc(a.target_count || 40)}</td>
-        <td class="num">${esc(fmtTime(a.renewed_at))}</td>
-        <td>
-          <div class="actions">
-            <button type="button" data-act="edit" data-id="${esc(a.id)}">编辑</button>
-            <button type="button" data-act="toggle" data-id="${esc(a.id)}" data-enabled="${a.enabled === false ? "0" : "1"}">${a.enabled === false ? "启用" : "停用"}</button>
-            <button type="button" class="danger" data-act="delete" data-id="${esc(a.id)}">删除</button>
-          </div>
-        </td>
-      </tr>`,
-    )
-    .join("");
+  for (const account of state.accounts) {
+    const id = String(account.id);
+    let row = accountRows.get(id);
+    if (!row) {
+      row = $("account-row-template").content.firstElementChild.cloneNode(true);
+      row.dataset.id = id;
+      tbody.append(row);
+      accountRows.set(id, row);
+    }
+    const name = String(account.label || id);
+    putText(row.querySelector(".avatar"), [...name][0] || "账");
+    putText(row.querySelector(".account-name"), name);
+    row.querySelector(".account-name").title = name;
+    putText(row.querySelector(".account-id"), id.slice(0, 12));
+    const [kind, status, action] = rowStatus(account);
+    const badge = row.querySelector(".account-status");
+    badge.className = "badge account-status " + kind;
+    putText(badge, status);
+    badge.title = account.note || status;
+    const done = data.byAccount.get(id) || 0;
+    putText(row.querySelector(".read-text"), vm.minutes(done) + " / " + vm.minutes(vm.targetCount(account)));
+    const currentCount = action === "stop" ? vm.count(account.progress.read_count) : done;
+    const percent = Math.min(100, Math.round(100 * currentCount / vm.targetCount(account)));
+    const meter = row.querySelector(".progress");
+    meter.classList.toggle("complete", percent === 100 && action !== "stop");
+    meter.setAttribute("aria-label", name + "阅读进度");
+    meter.setAttribute("aria-valuenow", String(percent));
+    row.querySelector(".progress i").style.width = percent + "%";
+    putText(row.querySelector(".last-ok"), vm.formatTime(account.last_ok_at));
+    row.querySelector(".last-ok").title = account.last_ok_at || "";
+    putText(row.querySelector(".last-renew"), relativeTime(account.renewed_at));
+    row.querySelector(".last-renew").title = account.renewed_at || "";
+    const run = row.querySelector(".row-run");
+    run.dataset.act = action;
+    run.disabled = action === "none";
+    run.classList.toggle("rebind", action === "rebind" || action === "capture");
+    putText(run, action === "rebind" ? "重绑" : action === "capture" ? "取参" : action === "stop" ? "■" : "▶");
+    run.setAttribute("aria-label", (action === "rebind" ? "重新绑定" : action === "capture" ? "自动获取参数" : action === "stop" ? "停止" : "运行") + name);
+    for (const button of row.querySelectorAll("button")) {
+      button.dataset.id = id;
+      if (button.dataset.act === "edit" || button.dataset.act === "delete") {
+        button.disabled = account.status === "bad";
+        button.setAttribute("aria-label", (button.dataset.act === "edit" ? "编辑" : "删除") + name);
+      }
+      if (state.accountActions.has(id)) button.disabled = true;
+    }
+  }
+  $("account-table").hidden = !state.accounts.length;
+  $("account-empty").hidden = state.accounts.length > 0;
+  putText($("account-empty-text"), state.status === "connected" ? "还没有账户，扫码添加后自动获取阅读参数。" : "连接仓库后查看账户。");
+  putText($("btn-empty-action"), state.status === "connected" ? "添加账户" : "连接仓库");
+  putText($("acc-count"), state.accounts.length ? state.accounts.length + " 个" : "");
 }
-
-function renderRuns(runs) {
-  const byDay = new Map();
-  for (const run of runs) {
-    const day = String(run.at || run.started_at || "").slice(0, 10);
-    if (!day) continue;
-    byDay.set(day, (byDay.get(day) || 0) + Number(run.read_count || 0));
-  }
-  const days = [...byDay.keys()].sort().slice(-14);
-  const max = Math.max(1, ...days.map((day) => byDay.get(day)));
-  const today = new Date().toISOString().slice(0, 10);
-  $("run-bars").innerHTML = days
-    .map((day) => {
-      const value = byDay.get(day);
-      const pct = Math.round((value / max) * 100);
-      return `<div class="bar-col" title="${esc(day)}：${value} 次"><div class="fill${day === today ? " accent" : ""}" style="height:${pct}%"></div></div>`;
-    })
-    .join("") || '<div class="sub">暂无数据</div>';
-
-  const last = [...runs].slice(-8).reverse();
-  $("run-list").innerHTML =
-    last
-      .map(
-        (run) => `<li><time>${esc(fmtTime(run.at || run.started_at))}</time>
-          <span>${esc(run.label || run.account_id || "")}</span>
-          <span class="num">${esc(run.read_count || 0)} 次</span>
-          <span class="sub">${esc(run.reason || "ok")}</span></li>`,
-      )
-      .join("") || '<li class="sub">暂无运行记录</li>';
+function relativeTime(value) {
+  if (!value) return "—";
+  const seconds = (Date.now() - new Date(value).getTime()) / 1000;
+  if (!Number.isFinite(seconds)) return "—";
+  if (seconds < 60) return "刚刚";
+  if (seconds < 3600) return Math.floor(seconds / 60) + " 分前";
+  if (seconds < 86400) return Math.floor(seconds / 3600) + " 小时前";
+  return Math.floor(seconds / 86400) + " 天前";
 }
-
-async function refreshAll() {
-  if (!state.cfg.repo || !state.cfg.token) return;
-  if (!state.stateKey) {
-    say("还没有填状态密钥，账户与记录都解不开。", "warn");
-    return;
+function renderRuns() {
+  const records = vm.sortRuns(state.runs).slice(0, 100);
+  const keys = new Set(records.map(vm.runKey));
+  for (const [key, row] of recordRows) if (!keys.has(key)) { row.remove(); recordRows.delete(key); }
+  let previous = null;
+  for (const record of records) {
+    const key = vm.runKey(record);
+    let row = recordRows.get(key);
+    if (!row) { row = $("record-row-template").content.firstElementChild.cloneNode(true); recordRows.set(key, row); }
+    const anchor = previous ? previous.nextSibling : $("run-list").firstChild;
+    if (anchor !== row) $("run-list").insertBefore(row, anchor);
+    previous = row;
+    putText(row.querySelector("time"), vm.formatTime(vm.runTime(record)));
+    row.querySelector("time").title = vm.runTime(record);
+    putText(row.querySelector(".record-name"), record.label || record.account_id || "账户");
+    let kind = "bad", text = "未完成";
+    if (vm.successful(record)) { kind = "ok"; text = "成功"; }
+    else if (record.reason === "cancelled") { kind = "neutral"; text = "已停止"; }
+    else if (record.state_error) text = "保存失败";
+    else if (record.level === "L3") { kind = "warn"; text = "需处理"; }
+    const badge = row.querySelector(".badge");
+    badge.className = "badge " + kind;
+    putText(badge, text);
+    badge.title = record.reason || text;
+    putText(row.querySelector(".record-count"), vm.minutes(record.read_count) + " / " + vm.minutes(vm.targetCount(record)));
+    const seconds = Math.max(0, Math.round((Date.parse(record.finished_at) - Date.parse(record.started_at)) / 1000));
+    putText(row.querySelector(".record-duration"), Number.isFinite(seconds) ? Math.floor(seconds / 60) + " 分 " + String(seconds % 60).padStart(2, "0") + " 秒" : "—");
   }
-  try {
-    state.accounts = await loadAccounts();
-    state.runs = await loadRuns();
-    renderAccounts();
-    renderRuns(state.runs);
-    renderMetrics(state.runs);
-  } catch (error) {
-    say(`读取状态失败：${error.message}`, "bad");
-  }
+  $("record-table").hidden = !records.length;
+  $("record-empty").hidden = records.length > 0;
+  putText($("run-hint"), "最近 " + records.length + " 条 · 每次成功读取按 30 秒折算");
 }
-
-// ---------------------------------------------------------------- 下发指令
-
-async function sendInstruction(action, payload, { quiet = false } = {}) {
-  if (!state.publicKey) {
-    say("还没有指令公钥：先跑一次 control.yml（control=init）拿到 public_key。", "bad");
-    return null;
+function renderChart() {
+  const days = vm.chartData(state.accounts, state.runs);
+  const keys = new Set(days.map(day => day.day));
+  for (const [key, column] of chartColumns) if (!keys.has(key)) { column.remove(); chartColumns.delete(key); }
+  const goal = Math.max(1, ...days.map(day => day.target));
+  const max = Math.max(goal, Math.ceil(Math.max(0, ...days.map(day => day.value || 0)) / goal) * goal);
+  for (const day of days) {
+    let column = chartColumns.get(day.day);
+    if (!column) {
+      column = $("chart-column-template").content.firstElementChild.cloneNode(true);
+      $("run-bars").append(column);
+      chartColumns.set(day.day, column);
+    }
+    const percent = day.value == null ? 100 : Math.min(100, 100 * day.value / max);
+    column.classList.toggle("full", day.full);
+    column.classList.toggle("missing", day.value == null);
+    column.classList.toggle("today", day.day === vm.dayKey(Date.now()));
+    column.style.setProperty("--height", percent + "%");
+    putText(column.querySelector(".bar-value"), day.value == null ? "—" : String(day.value));
+    putText(column.querySelector(".bar-date"), day.day.slice(-2));
+    const description = day.day + (day.value == null ? " 无记录" : " " + day.value + " 分钟");
+    column.setAttribute("aria-label", description);
+    putText(column.querySelector(".bar-tooltip"), description);
   }
-  const sessionId = newSessionId();
+  const empty = days.every(day => day.value == null);
+  $("chart").hidden = empty;
+  $("chart-empty").hidden = !empty;
+}
+function renderAll() {
+  const hostOwner = location.hostname.endsWith(".github.io") ? location.hostname.slice(0, -10) : "";
+  const siteRepo = location.pathname.split("/").filter(Boolean)[0];
+  const repo = state.cfg.repo || (hostOwner && siteRepo ? hostOwner + "/" + siteRepo : "maroubao/wxread");
+  $("manual-link").href = "https://github.com/" + repo + "/blob/main/docs/RUNBOOK.md";
+  $("maintenance-link").href = "https://github.com/" + repo + "/blob/main/docs/MAINTENANCE.md";
+  const connected = state.status === "connected";
+  const data = vm.summary(state.accounts, state.runs);
+  putText($("m-read"), connected && data.hasToday ? vm.minutes(data.readCount) : "—");
+  putText($("m-read-hint"), connected ? "可运行目标 " + vm.minutes(data.target) + " 分 · 还差 " + vm.minutes(data.remaining) + " 分" : "连接后显示阅读进度");
+  putText($("m-accounts"), connected ? state.accounts.length : "—");
+  putText($("m-accounts-hint"), connected ? data.activeCount + " 可运行 · " + data.completed + " 已达标" : "连接后显示账户状态");
+  putText($("m-last"), connected && data.successRate != null ? data.successRate : "—");
+  putText($("m-last-hint"), connected && data.totalRuns ? data.wins + " 成功 / " + data.totalRuns + " 次运行" : "暂无运行记录");
+  putText($("m-needs"), connected ? data.needsLogin.length : "—");
+  putText($("m-needs-hint"), data.needsPayload.length ? data.needsPayload.length + " 个账户待自动取参" : "扫码后自动恢复");
+  $("needs-card").classList.toggle("warning", data.needsLogin.length > 0);
+  const problem = data.needsLogin[0] || data.needsPayload[0];
+  $("account-alert").hidden = !connected || !problem;
+  if (problem) {
+    putText($("account-alert-title"), (problem.label || problem.id) + (data.needsLogin.includes(problem) ? " 需要重新绑定" : " 阅读参数待准备"));
+    putText($("account-alert-detail"), data.needsLogin.includes(problem) ? "扫码确认后自动获取阅读参数并恢复运行。" : "使用已有登录态重新自动获取阅读参数。");
+    $("btn-alert-action").dataset.id = problem.id;
+    $("btn-alert-action").dataset.action = data.needsLogin.includes(problem) ? "rebind" : "capture";
+    putText($("btn-alert-action"), data.needsLogin.includes(problem) ? "重新绑定" : "自动获取");
+  }
+  const schedule = state.settings.schedule || {};
+  putText($("plan-warm"), schedule.warm_hours === 0 || schedule.enabled === false ? "已关闭" : "每 6 小时");
+  const nowClock = new Intl.DateTimeFormat("en-GB", { timeZone: "Asia/Shanghai", hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).format(Date.now());
+  putText($("plan-next"), schedule.enabled === false ? "已暂停" : (nowClock < "01:07" ? "今天" : "明天") + " 01:07");
+  const channels = state.settings.notifications?.enabled ? state.settings.notifications.channels || [] : [];
+  putText($("plan-notify"), channels.map(channel => CHANNEL_NAMES[channel] || channel).join(" · ") || "未配置");
+  putText($("sync-time"), state.syncedAt ? "上次同步 " + relativeTime(state.syncedAt) : "尚未同步");
+  putText($("overview-hint"), vm.dayKey(Date.now()) + " · 北京时间");
+  renderAccounts(data);
+  renderRuns();
+  renderChart();
+  document.body.classList.toggle("loading", state.status === "connecting");
+  updateConnection();
+  updateButtons();
+}
+function requireConnection() {
+  if (state.status !== "connected" || !state.publicKey) throw new Error("先连接仓库。");
+}
+async function dispatchInstruction(action, payload, onPrepared) {
+  requireConnection();
+  const id = crypto.randomUUID().replaceAll("-", "").slice(0, 24);
   const reply = c.newKeypair();
-  state.sessions.set(sessionId, reply.secretKey);
-  const instruction = {
-    action,
-    session_id: sessionId,
-    issued_at: Math.floor(Date.now() / 1000),
-    nonce: c.b64e(c.randomBytes(12)),
-    payload: payload || {},
-    reply_key: c.b64e(reply.publicKey),
-  };
-  const envelope = c.seal(instruction, state.publicKey, c.newKeypair());
-  await gh.dispatchWorkflow(state.cfg, "control.yml", {
-    control: "instruction",
-    instruction: JSON.stringify(envelope),
-    session_id: sessionId,
-  });
-  if (!quiet) say(`已下发 ${action}，等待 control.yml 回执…`);
-  pollReceipt(sessionId, action);
-  return sessionId;
-}
-
-async function pollReceipt(sessionId, action, tries = 0) {
-  const file = await gh.getFile(state.cfg, `responses/${sessionId}.json`);
-  if (!file) {
-    if (tries >= RECEIPT_TRIES) {
-      say(`${action} 还没有回执：去 Actions 里看 control 运行日志。`, "warn");
-      return;
-    }
-    setTimeout(() => pollReceipt(sessionId, action, tries + 1).catch(() => {}), RECEIPT_POLL_MS);
-    return;
-  }
+  const session = { id, action, secret: reply.secretKey, startedAt: Date.now(), epoch: state.epoch, cfg: state.cfg };
+  state.sessions.set(id, session);
+  const envelope = c.seal({
+    action, session_id: id, issued_at: Math.floor(Date.now() / 1000),
+    nonce: c.b64e(c.randomBytes(12)), payload, reply_key: c.b64e(reply.publicKey),
+  }, state.publicKey);
   try {
-    const envelope = JSON.parse(new TextDecoder().decode(file.bytes));
-    const receipt = c.unseal(envelope, state.sessions.get(sessionId));
-    const ok = receipt.ok !== false;
-    if (action === "qr") {
-      // 二维码的收尾由 finishQr 统一做（收起面板、刷新账户表），这里不重复说话
-      finishQr(sessionId, receipt, ok);
-      return;
-    }
-    say(`${action} ${ok ? "完成" : "失败"}：${JSON.stringify(receipt).slice(0, 400)}`, ok ? "ok" : "bad");
-    await refreshAll();
+    if (onPrepared && onPrepared(session) === false) throw aborted();
+    await gh.dispatchWorkflow(session.cfg, "control.yml", { control: "instruction", instruction: JSON.stringify(envelope), session_id: id });
   } catch (error) {
-    say(`回执解不开：${error.message}`, "bad");
+    if (session.cancelled || [401, 403, 404, 422].includes(error.status) || error.name === "AbortError") { endSession(id); throw session.cancelled ? aborted() : error; }
+    say("提交状态待确认，正在检查同一条指令回执。", "warn");
   }
+  check(session.epoch);
+  if (session.cancelled) { endSession(id); throw aborted(); }
+  return session;
 }
-
-// ---------------------------------------------------------------- 二维码
-
-async function findSessionQr(sessionId) {
-  // 帧名 = qr-<session>-<seq>-<fp>.png，序号保证按名字排序就是时间顺序。
-  // 只认本次会话的帧：上一轮留下的（可能带过期浮层的）旧图永远不会被显示。
-  const dir = await gh.listDir(state.cfg, "responses");
-  const prefix = `qr-${sessionId}-`;
-  const names = dir
-    .filter((item) => item.name.startsWith(prefix) && item.name.endsWith(".png"))
-    .map((item) => item.name)
-    .sort();
-  return names.length ? `responses/${names[names.length - 1]}` : null;
+function decryptReceipt(session, file) {
+  check(session.epoch);
+  const receipt = c.unseal(JSON.parse(new TextDecoder().decode(file.bytes)), session.secret);
+  if (receipt.session_id !== session.id || receipt.action !== session.action || (!receipt.pending && typeof receipt.ok !== "boolean")) throw new Error("回执字段无法验证。");
+  return receipt;
 }
-
+async function pollReceipt(sessionId, action) {
+  const session = state.sessions.get(sessionId);
+  if (!session || session.action !== action) throw aborted();
+  while (Date.now() - session.startedAt < RECEIPT_BUDGET_MS) {
+    check(session.epoch);
+    try {
+      const file = await gh.getFile(session.cfg, "responses/" + sessionId + ".json");
+      if (file) {
+        const receipt = decryptReceipt(session, file);
+        if (!receipt.pending) return receipt;
+      }
+    } catch (error) {
+      if (error.name === "AbortError" || [401, 403].includes(error.status) || error instanceof c.CryptoFailure || error instanceof SyntaxError || error.message === "回执字段无法验证。") throw error;
+    }
+    await delay(RECEIPT_POLL_MS, session.cfg.signal);
+  }
+  throw new Error("尚未收到操作确认，查看Actions里的control运行。");
+}
+async function sendInstruction(action, payload) {
+  const session = await dispatchInstruction(action, payload);
+  say("操作已提交，正在等待结果。");
+  try {
+    const receipt = await pollReceipt(session.id, action);
+    check(session.epoch);
+    if (receipt.ok !== true) throw new Error(receipt.error || receipt.reason || "操作未成功。");
+    await refreshAll(true);
+    return receipt;
+  } finally { endSession(session.id); }
+}
 function showQrPanel(live) {
   $("qr-idle").hidden = live;
   $("qr-live").hidden = !live;
-  if (live) {
-    $("qr-slot").innerHTML =
-      '<div class="empty">已申请，等待 control.yml 生成二维码…<br />首次要装浏览器依赖，通常 1–2 分钟。</div>';
-    $("qr-hint").textContent = "正在生成二维码…";
-  } else {
-    $("qr-slot").innerHTML = '<div class="empty">这一轮结束了。要加账户再点“扫码添加账户”。</div>';
-  }
+  if (!live) { releaseQrImage(); $("qr-slot").replaceChildren(); $("qr-slot").classList.remove("capturing"); }
 }
-
 function clearQrSession() {
-  const sessionId = state.qrSession;
+  const session = state.qrSession;
   state.qrSession = null;
-  try {
-    sessionStorage.removeItem("wxread.qrSession");
-    sessionStorage.removeItem("wxread.qrReplyKey");
-  } catch (error) {
-    // 隐私模式下 sessionStorage 不可用，忽略
-  }
-  return sessionId;
+  state.qrAttempt = null;
+  state.askingQr = false;
+  try { sessionStorage.removeItem("wxread.qr.v2"); } catch { /* 私密模式 */ }
+  if (session) endSession(session.id);
+  releaseQrImage();
+  return session;
 }
-
-function finishQr(sessionId, receipt, ok) {
-  if (state.qrSession !== sessionId) return; // 已经收过尾了，重复回执不再刷屏
+async function finishQr(sessionId, receipt, ok) {
+  if (state.qrSession?.id !== sessionId) return;
+  const epoch = state.epoch;
   clearQrSession();
   showQrPanel(false);
-  const who = (receipt && (receipt.label || receipt.account_id)) || "";
-  if (ok) {
-    const captured = receipt && receipt.payload_captured;
-    const tail = captured
-      ? "阅读参数已自动从浏览器里取到，可以直接“按上面的参数试读”。"
-      : "这次没抓到阅读参数（书架没打开成功或那本书没正文），去“导入 cURL”补一次 appId/ps/pc 也能跑。";
-    say(`账户已绑定${who ? `：${who}` : ""}。二维码区已收起。${tail}`, "ok");
-  } else {
-    say(`扫码没有成功${receipt && receipt.error ? `：${receipt.error}` : ""}。要重试再点“扫码添加账户”。`, "bad");
+  closeDialog("qr-dialog");
+  await refreshAll(true);
+  check(epoch);
+  if (!ok) throw new Error(receipt.error || receipt.reason || "绑定未成功，可重新扫码。");
+  if (!receipt.payload_captured) {
+    say("登录已保存，正在使用登录态自动重试取参。", "warn");
+    await sendInstruction("capture", { account_id: receipt.account_id });
   }
-  refreshAll().catch(() => {});
+  check(epoch);
+  say("账户已绑定，阅读参数已自动获取，可以直接运行。", "ok");
 }
-
 async function qrReceipt(sessionId) {
-  // 回执 = 这一轮跑完了（成功或失败）。轮询它，扫码成功后立刻收尾，不用等 15 分钟预算烧完。
-  const file = await gh.getFile(state.cfg, `responses/${sessionId}.json`).catch(() => null);
-  if (!file) return null;
-  const secret = state.sessions.get(sessionId);
-  if (!secret) return {}; // 换过标签页、私钥丢了：只知道它结束了，解不开内容
-  try {
-    return c.unseal(JSON.parse(new TextDecoder().decode(file.bytes)), secret);
-  } catch (error) {
-    return {};
-  }
+  const session = state.sessions.get(sessionId);
+  if (!session) throw new Error("本次回执密钥已失效，无法确认绑定结果。");
+  const file = await gh.getFile(session.cfg, "responses/" + sessionId + ".json");
+  if (!file || state.qrSession?.id !== sessionId) return null;
+  return decryptReceipt(session, file);
 }
-
+async function findSessionQr(sessionId) {
+  const session = state.sessions.get(sessionId);
+  if (!session) throw aborted();
+  const files = await gh.listDir(session.cfg, "responses");
+  const prefix = "qr-" + sessionId + "-";
+  const names = files.filter(file => file.name.startsWith(prefix) && file.name.endsWith(".png")).map(file => file.name).sort();
+  return names.length ? "responses/" + names[names.length - 1] : null;
+}
 async function pollQr(startedAt = Date.now(), shownPath = null) {
-  if (!state.qrSession) return;
-  const sessionId = state.qrSession;
-  if (Date.now() - startedAt > QR_BUDGET_MS) {
-    clearQrSession();
-    showQrPanel(false);
-    say('这一轮扫码超时（15 分钟）：二维码区已收起，需要的话重新点“扫码添加账户”。', "warn");
-    return;
-  }
-  const receipt = await qrReceipt(sessionId);
-  if (receipt) {
-    finishQr(sessionId, receipt, receipt.ok !== false);
-    return;
-  }
-  if (state.qrSession !== sessionId) return;
-  const elapsed = Math.round((Date.now() - startedAt) / 1000);
-  let path = null;
+  const session = state.qrSession;
+  if (!session || state.qrPolling === session.id) return;
+  const sessionId = session.id;
+  state.qrPolling = sessionId;
   try {
-    path = await findSessionQr(sessionId);
-  } catch (error) {
-    // 网络抖动不算失败，下一轮再看
-  }
-  if (path && path !== shownPath) {
-    const file = await gh.getFile(state.cfg, path);
-    if (file) {
-      const url = URL.createObjectURL(new Blob([file.bytes], { type: "image/png" }));
-      $("qr-slot").innerHTML = `<img alt="微信读书登录二维码，用微信扫描" src="${url}" />`;
-      shownPath = path;
-      state.qrShots += 1;
-      $("qr-hint").textContent = `第 ${state.qrShots} 张码，已等 ${elapsed} 秒。用微信扫一扫；过期会自动换新码。`;
-      say(`二维码已就绪（第 ${state.qrShots} 张，等了 ${elapsed} 秒），用微信扫一扫；过期会自动换新码。`, "ok");
+    while (state.qrSession?.id === sessionId && Date.now() - startedAt < QR_BUDGET_MS) {
+      check(session.epoch);
+      try {
+        const receipt = await qrReceipt(sessionId);
+        if (receipt && !receipt.pending) { await finishQr(sessionId, receipt, receipt.ok === true); return; }
+        if (receipt?.pending) {
+          releaseQrImage();
+          $("qr-slot").classList.add("capturing");
+          putText($("qr-slot"), receipt.message || "登录已确认，正在自动获取阅读参数。");
+          putText($("qr-hint"), "自动获取中 · 已等 " + Math.round((Date.now() - startedAt) / 1000) + " 秒");
+        } else {
+          const path = await findSessionQr(sessionId);
+          if (path && path !== shownPath) {
+            const file = await gh.getFile(session.cfg, path);
+            if (file && state.qrSession?.id === sessionId) {
+              releaseQrImage();
+              state.qrUrl = URL.createObjectURL(new Blob([file.bytes], { type: "image/png" }));
+              const image = document.createElement("img");
+              image.src = state.qrUrl;
+              image.alt = "微信读书登录二维码，用微信扫描";
+              $("qr-slot").classList.remove("capturing");
+              $("qr-slot").replaceChildren(image);
+              shownPath = path;
+              putText($("qr-hint"), "用微信扫码并确认登录，过期后自动换新码。");
+            }
+          } else if (!shownPath) putText($("qr-slot"), "正在等待Actions生成二维码…");
+        }
+      } catch (error) {
+        if (session.cancelled) return;
+        if (state.qrSession?.id !== sessionId) throw error;
+        if (error.name === "AbortError" || [401, 403].includes(error.status)) throw error;
+        putText($("qr-hint"), "暂未确认绑定结果：" + error.message);
+      }
+      await delay(QR_POLL_MS, session.cfg.signal);
     }
-  } else if (!shownPath) {
-    $("qr-slot").innerHTML =
-      `<div class="empty">control.yml 启动中…（已等 ${elapsed} 秒）` +
-      `<br />首次要装浏览器依赖，通常 1–2 分钟；码一出来就显示在这里。</div>`;
-    $("qr-hint").textContent = `正在生成二维码…（已等 ${elapsed} 秒）`;
+    if (state.qrSession?.id === sessionId) {
+      clearQrSession();
+      showQrPanel(false);
+      say("本轮扫码等待已结束，可重新发起。", "warn");
+    }
+  } finally {
+    if (state.qrPolling === sessionId) state.qrPolling = null;
   }
-  setTimeout(() => pollQr(startedAt, shownPath).catch(() => {}), QR_POLL_MS);
 }
-
 async function askQr() {
-  if (state.qrSession) {
-    say("已经有一轮扫码在进行中：等它结束，或先点“取消”。", "warn");
+  if (state.qrSession || state.askingQr) return;
+  state.askingQr = true;
+  const attempt = { session: null, cancelPromise: null };
+  state.qrAttempt = attempt;
+  updateButtons();
+  try {
+    const session = await dispatchInstruction("qr", { label: $("inp-qr-label").value.trim(), timeout: 600 }, prepared => {
+      attempt.session = prepared;
+      return state.qrAttempt === attempt;
+    });
+    if (state.qrAttempt !== attempt) {
+      session.cancelled = true;
+      endSession(session.id);
+      await (attempt.cancelPromise || cancelControlRun(session));
+      return;
+    }
+    state.qrSession = session;
     showQrPanel(true);
-    return;
-  }
-  state.qrShots = 0;
-  showQrPanel(true);
-  const sessionId = await sendInstruction("qr", { label: $("inp-qr-label").value.trim(), timeout: 600 });
-  if (!sessionId) {
-    showQrPanel(false);
-    return;
-  }
-  state.qrSession = sessionId;
-  try {
-    sessionStorage.setItem("wxread.qrSession", sessionId);
-    const secret = state.sessions.get(sessionId);
-    if (secret) sessionStorage.setItem("wxread.qrReplyKey", c.b64e(secret));
-  } catch (error) {
-    // 隐私模式下 sessionStorage 不可用，忽略
-  }
-  pollQr().catch(() => {});
-}
-
-// ---------------------------------------------------------------- 手动运行
-
-const RUN_STATE = { queued: "排队中", in_progress: "进行中", waiting: "等待中", completed: "结束" };
-const RUN_VERDICT = {
-  success: "成功",
-  failure: "失败",
-  cancelled: "已取消",
-  timed_out: "超时",
-  skipped: "跳过",
-};
-
-function numberOrZero(id) {
-  const value = Number($(id).value);
-  return Number.isFinite(value) && value > 0 ? Math.round(value) : 0;
-}
-
-async function startRun(workflow, inputs, noun) {
-  const startedAt = Date.now();
-  try {
-    await gh.dispatchWorkflow(state.cfg, workflow, inputs);
-  } catch (error) {
-    say(`${noun}触发失败：${error.message}`, "bad");
-    return;
-  }
-  say(`已触发 ${workflow}，正在等它出现在运行列表里…`, "ok");
-  trackRun(workflow, startedAt, noun).catch((error) => say(`跟踪${noun}状态失败：${error.message}`, "warn"));
-}
-
-async function trackRun(workflow, startedAt, noun, tries = 0) {
-  // dispatch 之后 GitHub 要几秒才把这次 run 放进列表，所以按 created_at 找，不按 id 猜。
-  if (tries > 120) {
-    say(`${noun}十分钟还没结束：去 Actions 页面看日志。`, "warn");
-    return;
-  }
-  let runs = [];
-  try {
-    runs = await gh.listRuns(state.cfg, workflow);
-  } catch (error) {
-    say(`查询${noun}状态失败：${error.message}`, "warn");
-    return;
-  }
-  const mine = runs.find((run) => {
-    const created = Date.parse(run.created_at || "");
-    return Number.isFinite(created) && created >= startedAt - 15_000;
-  });
-  if (!mine) {
-    if (tries === 4) say("还没出现在运行列表里：可能还在排队，或 token 少了 actions 权限。", "warn");
-    setTimeout(() => trackRun(workflow, startedAt, noun, tries + 1).catch(() => {}), RUN_POLL_MS);
-    return;
-  }
-  if (mine.status !== "completed") {
-    if (tries % 3 === 0) say(`${noun} #${mine.run_number} ${RUN_STATE[mine.status] || mine.status}…`);
-    setTimeout(() => trackRun(workflow, startedAt, noun, tries + 1).catch(() => {}), RUN_POLL_MS);
-    return;
-  }
-  const verdict = RUN_VERDICT[mine.conclusion] || mine.conclusion || "结束";
-  const ok = mine.conclusion === "success";
-  say(`${noun} #${mine.run_number} ${verdict}。日志：${mine.html_url}`, ok ? "ok" : "bad");
-  if (ok) await refreshAll().catch(() => {});
-}
-
-// ---------------------------------------------------------------- 事件
-
-function bind() {
-  $("btn-connect").addEventListener("click", () => connect().catch((error) => say(error.message, "bad")));
-  $("btn-forget").addEventListener("click", forget);
-  $("btn-refresh").addEventListener("click", () => refreshAll().catch((error) => say(error.message, "bad")));
-  $("btn-qr").addEventListener("click", () => askQr().catch((error) => say(error.message, "bad")));
-  $("btn-qr-poll").addEventListener("click", () => pollQr().catch(() => {}));
-  $("btn-qr-cancel").addEventListener("click", async () => {
-    const sessionId = clearQrSession();
-    showQrPanel(false);
-    say("已收起二维码区。", "ok");
-    if (!sessionId) return;
+    putText($("qr-slot"), "正在生成二维码…");
     try {
-      const runs = await gh.listRuns(state.cfg, "control.yml");
-      const running = runs.find((run) => run.status === "in_progress" || run.status === "queued");
-      if (running) {
-        await gh.cancelRun(state.cfg, running.id);
-        say(`已请求取消 control 运行 #${running.run_number}。`, "ok");
-      }
-    } catch (error) {
-      say(`取消 control 运行失败（不影响已收起的界面）：${error.message}`, "warn");
+      sessionStorage.setItem("wxread.qr.v2", JSON.stringify({ id: session.id, repo: state.cfg.repo, branch: state.cfg.branch, secret: c.b64e(session.secret), startedAt: session.startedAt }));
+    } catch { /* 私密模式仅使用内存 */ }
+    await pollQr(session.startedAt);
+  } finally {
+    if (state.qrAttempt === attempt) { state.qrAttempt = null; state.askingQr = false; }
+    updateButtons();
+  }
+}
+function restoreQrSession() {
+  try {
+    const saved = JSON.parse(sessionStorage.getItem("wxread.qr.v2") || "null");
+    if (!saved || saved.repo !== state.cfg.repo || saved.branch !== state.cfg.branch || Date.now() - saved.startedAt >= QR_BUDGET_MS) {
+      sessionStorage.removeItem("wxread.qr.v2"); return;
     }
-  });
-
-  const runRead = () => {
-    const inputs = {};
-    const pace = numberOrZero("inp-pace");
-    const deadline = numberOrZero("inp-deadline");
-    if (pace) inputs.pace = String(pace);
-    if (deadline) inputs.deadline = String(deadline);
-    startRun("read.yml", inputs, "阅读任务");
+    const session = { ...saved, action: "qr", secret: c.b64d(saved.secret), epoch: state.epoch, cfg: state.cfg };
+    state.sessions.set(session.id, session);
+    state.qrSession = session;
+    showDialog("qr-dialog");
+    showQrPanel(true);
+    pollQr(session.startedAt).catch(reportError);
+  } catch { /* 无可恢复扫码会话 */ }
+}
+async function cancelControlRun(session) {
+  const until = Date.now() + 30000;
+  do {
+    const runs = await gh.listRuns(session.cfg, "control.yml");
+    const mine = runs.find(run => String(run.display_title || "").includes(session.id));
+    if (mine) {
+      if (mine.status !== "completed") await gh.cancelRun(session.cfg, mine.id);
+      return true;
+    }
+    await delay(1000, session.cfg.signal);
+  } while (Date.now() < until);
+  return false;
+}
+async function cancelQr() {
+  const attempt = state.qrAttempt;
+  const pending = attempt?.session;
+  const session = clearQrSession() || pending;
+  showQrPanel(false);
+  closeDialog("qr-dialog");
+  updateButtons();
+  if (!session) return;
+  session.cancelled = true;
+  endSession(session.id);
+  const cancellation = cancelControlRun(session);
+  if (attempt) attempt.cancelPromise = cancellation;
+  const confirmed = await cancellation;
+  if (current(session.epoch)) say(confirmed ? "已请求取消本次绑定。" : "绑定窗口已关闭，取消运行尚未确认，可在Actions检查。", confirmed ? "" : "warn");
+}
+function openQr(label = "") {
+  requireConnection();
+  $("inp-qr-label").value = label;
+  showDialog("qr-dialog");
+  if (!state.qrSession) showQrPanel(false);
+}
+async function startRun(workflow, accountId = "") {
+  requireConnection();
+  if (state.tracks.has(workflow)) throw new Error("当前任务仍在运行，先查看结果。");
+  const requestId = crypto.randomUUID().replaceAll("-", "").slice(0, 24);
+  const inputs = { request_id: requestId };
+  if (workflow === "read.yml") {
+    if (accountId) inputs.account_ids = accountId;
+    const pace = vm.count($("inp-pace").value);
+    const deadline = vm.count($("inp-deadline").value);
+    if (pace) inputs.pace = String(Math.round(pace));
+    if (deadline) inputs.deadline = String(Math.round(deadline));
+  }
+  const track = { requestId, epoch: state.epoch, cfg: state.cfg, startedAt: Date.now(), id: null };
+  state.tracks.set(workflow, track);
+  updateButtons();
+  try {
+    await gh.dispatchWorkflow(track.cfg, workflow, inputs);
+    check(track.epoch);
+    say("任务已提交，正在等待Actions运行。", "ok");
+    trackRun(workflow, track).catch(reportError);
+  } catch (error) { state.tracks.delete(workflow); updateButtons(); throw error; }
+}
+async function trackRun(workflow, track) {
+  try {
+    while (current(track.epoch) && state.tracks.get(workflow) === track && Date.now() - track.startedAt < RUN_BUDGET_MS) {
+      try {
+        const runs = await gh.listRuns(track.cfg, workflow);
+        check(track.epoch);
+        const mine = track.id ? runs.find(run => run.id === track.id) : runs.find(run => String(run.display_title || "").includes(track.requestId));
+        if (mine) {
+          track.id = mine.id;
+          if (mine.status === "completed") {
+            await refreshAll(true);
+            check(track.epoch);
+            say("任务" + (mine.conclusion === "success" ? "完成" : "结束：" + mine.conclusion) + "，运行结果已刷新。", mine.conclusion === "success" ? "ok" : "warn");
+            return;
+          }
+        }
+      } catch (error) {
+        if (error.name === "AbortError" || [401, 403].includes(error.status)) throw error;
+      }
+      await delay(RUN_POLL_MS, track.cfg.signal);
+    }
+    if (current(track.epoch)) say("任务尚未确认结束，查看Actions运行状态。", "warn");
+  } finally {
+    if (state.tracks.get(workflow) === track) state.tracks.delete(workflow);
+    updateButtons();
+  }
+}
+async function stopAll() {
+  requireConnection();
+  const runs = await gh.listRuns(state.cfg, "read.yml");
+  const active = runs.filter(run => ["queued", "in_progress", "waiting", "requested"].includes(run.status));
+  if (!active.length) { say("当前没有运行中的阅读任务。"); return; }
+  await Promise.all(active.map(run => gh.cancelRun(state.cfg, run.id)));
+  say("已请求停止阅读任务，正在等待进度回写。", "warn");
+}
+function openSettings() {
+  requireConnection();
+  const schedule = state.settings.schedule || {};
+  $("inp-auto-enabled").checked = schedule.enabled !== false;
+  $("inp-warm-enabled").checked = schedule.warm_hours !== 0;
+  const block = state.settings.notifications || {};
+  for (const input of document.querySelectorAll('input[name="channel"]')) input.checked = block.enabled !== false && (block.channels || ["feishu"]).includes(input.value);
+  for (const [channel, title] of Object.entries(CHANNEL_NAMES)) {
+    const cfg = block[channel] || {};
+    putText($(channel + "-saved"), Object.keys(cfg).length ? "已保存" : "");
+    const secretFields = channel === "email" ? ["password"] : channel === "pushplus" ? ["token"] : channel === "feishu" ? ["webhook", "secret"] : ["bot-token"];
+    for (const field of secretFields) {
+      const input = $(channel + "-" + field);
+      input.value = "";
+      input.placeholder = Object.keys(cfg).length ? "已保存，留空沿用" : title + "口令";
+    }
+  }
+  const email = block.email || {};
+  for (const name of ["host", "port", "user", "to"]) $("email-" + name).value = email[name] || "";
+  $("telegram-chat-id").value = block.telegram?.chat_id || "";
+  showDialog("settings-dialog");
+}
+async function saveNotifications() {
+  const channels = [...document.querySelectorAll('input[name="channel"]:checked')].map(input => input.value);
+  const payload = { enabled: channels.length > 0, channels };
+  const fields = {
+    email: { host: "email-host", port: "email-port", user: "email-user", password: "email-password", to: "email-to" },
+    pushplus: { token: "pushplus-token" }, feishu: { webhook: "feishu-webhook", secret: "feishu-secret" },
+    telegram: { bot_token: "telegram-bot-token", chat_id: "telegram-chat-id" },
   };
-  $("btn-run").addEventListener("click", runRead);
-  $("btn-run-now").addEventListener("click", runRead);
-  $("btn-warm-now").addEventListener("click", () => startRun("warm.yml", {}, "保活任务"));
-
-  $("btn-import").addEventListener("click", async () => {
-    const curl = $("inp-curl").value.trim();
-    if (!curl) {
-      say("先把 cURL 贴进上面的框里。", "warn");
-      return;
+  for (const [channel, inputs] of Object.entries(fields)) {
+    const cfg = {};
+    for (const [name, id] of Object.entries(inputs)) {
+      const value = $(id).value.trim();
+      if (value) cfg[name] = name === "port" ? Number(value) : value;
     }
-    const payload = { curl };
-    const label = $("inp-curl-label").value.trim();
-    if (label) payload.label = label.slice(0, 24);
-    const target = numberOrZero("inp-curl-target");
-    if (target) payload.target_count = target;
-    await sendInstruction("import", payload);
-  });
-
-  $("btn-stop").addEventListener("click", async () => {
-    try {
-      const runs = await gh.listRuns(state.cfg, "read.yml");
-      const running = runs.find((run) => run.status === "in_progress" || run.status === "queued");
-      if (!running) {
-        say("当前没有在跑的阅读任务。", "warn");
-        return;
-      }
-      await gh.cancelRun(state.cfg, running.id);
-      say(`已请求停止 #${running.id}。`, "ok");
-    } catch (error) {
-      say(`停止失败：${error.message}`, "bad");
-    }
-  });
-
-  $("btn-schedule").addEventListener("click", async () => {
-    const daily = $("inp-daily").value || "01:07";
-    const warm = Number($("inp-warm").value);
-    await sendInstruction("schedule", { enabled: true, daily, warm_hours: warm });
-  });
-
-  $("btn-notify").addEventListener("click", async () => {
-    const channels = $("inp-channels")
-      .value.split(/[,，\s]+/)
-      .filter(Boolean);
-    await sendInstruction("notifications", { enabled: channels.length > 0, channels });
-  });
-
-  $("btn-test-mail").addEventListener("click", () => sendInstruction("test-mail", {}));
-  $("btn-test-push").addEventListener("click", () => {
-    const channel = ($("inp-channels").value.split(/[,，\s]+/).filter(Boolean)[0] || "feishu");
-    sendInstruction("test-push", { channel });
-  });
-
-  $("acc-body").addEventListener("click", async (event) => {
-    const button = event.target.closest("button[data-act]");
-    if (!button) return;
-    const id = button.dataset.id;
-    const act = button.dataset.act;
-    if (act === "delete") {
-      if (!confirm(`删除账户 ${id}？状态分支上的密文会被移除。`)) return;
-      await sendInstruction("delete", { account_id: id });
-      return;
-    }
-    if (act === "toggle") {
-      const enabled = button.dataset.enabled !== "1";
-      await sendInstruction("update", { account_id: id, enabled });
-      return;
-    }
-    if (act === "edit") {
-      const account = state.accounts.find((item) => item.id === id) || {};
-      const label = prompt("账户备注（≤24 字）", account.label || "");
-      if (label === null) return;
-      const target = prompt("每日目标次数（1–200）", String(account.target_count || 40));
-      if (target === null) return;
-      await sendInstruction("update", { account_id: id, label: label.slice(0, 24), target_count: Number(target) });
-    }
+    if (Object.keys(cfg).length) payload[channel] = cfg;
+  }
+  await sendInstruction("notifications", payload);
+  for (const input of $("notify-form").querySelectorAll('input[type="password"]')) input.value = "";
+  say("通知配置已保存。", "ok");
+}
+function editAccount(id) {
+  const account = state.accounts.find(item => item.id === id);
+  if (!account) return;
+  state.editId = id;
+  $("edit-label").value = account.label || "";
+  $("edit-target").value = vm.minutes(vm.targetCount(account));
+  $("edit-enabled").checked = account.enabled !== false;
+  showDialog("edit-dialog");
+  $("edit-label").focus();
+}
+async function saveAccount() {
+  await sendInstruction("update", { account_id: state.editId, label: $("edit-label").value.trim(), target_count: Math.round(Number($("edit-target").value) * 2), enabled: $("edit-enabled").checked });
+  closeDialog("edit-dialog");
+  say("账户设置已保存。", "ok");
+}
+function requestDelete(id) {
+  const account = state.accounts.find(item => item.id === id);
+  if (!account) return;
+  state.deleteId = id;
+  putText($("delete-title"), "删除 " + (account.label || id));
+  putText($("delete-description"), "该账户的登录凭据会删除，运行历史继续保留。");
+  showDialog("delete-dialog");
+}
+async function deleteAccount() {
+  await sendInstruction("delete", { account_id: state.deleteId });
+  closeDialog("delete-dialog");
+  state.deleteId = null;
+  $("btn-qr").focus();
+  say("账户已删除。");
+}
+async function accountAction(button) {
+  const account = state.accounts.find(item => item.id === button.dataset.id);
+  if (!account) return;
+  const action = button.dataset.act;
+  if (action === "edit") { editAccount(account.id); return; }
+  if (action === "delete") { requestDelete(account.id); return; }
+  if (action === "rebind") { openQr(account.label); return; }
+  if (action === "run") { await startRun("read.yml", account.id); return; }
+  if (action === "stop") { await sendInstruction("stop", { account_id: account.id, run_id: account.progress.run_id }); say("已请求停止该账户。"); return; }
+  if (action === "capture") { await sendInstruction("capture", { account_id: account.id }); say("阅读参数已自动更新。", "ok"); }
+}
+function reportError(error) {
+  if (error?.name !== "AbortError") say(error.message || "操作暂未确认。", "bad");
+}
+function click(id, handler) {
+  $(id).addEventListener("click", async event => {
+    const button = $(id);
+    if (button.getAttribute("aria-busy") === "true") return;
+    button.setAttribute("aria-busy", "true");
+    button.disabled = true;
+    try { await handler(event); } catch (error) { reportError(error); }
+    finally { button.removeAttribute("aria-busy"); button.disabled = false; updateButtons(); }
   });
 }
-
+function submit(id, buttonId, handler) {
+  $(id).addEventListener("submit", async event => {
+    event.preventDefault();
+    const button = $(buttonId);
+    if (button.getAttribute("aria-busy") === "true") return;
+    button.disabled = true;
+    button.setAttribute("aria-busy", "true");
+    try { await handler(); } catch (error) { reportError(error); }
+    finally { button.disabled = false; button.removeAttribute("aria-busy"); updateButtons(); }
+  });
+}
+function bind() {
+  for (const button of document.querySelectorAll("[data-close]")) button.addEventListener("click", () => button.closest("dialog").close());
+  for (const dialog of document.querySelectorAll("dialog")) dialog.addEventListener("close", () => {
+    for (const input of dialog.querySelectorAll('input[type="password"]')) if (dialog.id !== "connect-dialog") input.value = "";
+  });
+  $("qr-dialog").addEventListener("close", () => {
+    if (state.qrSession || state.qrAttempt) cancelQr().catch(reportError);
+  });
+  $("qr-dialog").addEventListener("cancel", event => { event.preventDefault(); cancelQr().catch(reportError); });
+  click("btn-config", () => showDialog("connect-dialog"));
+  click("btn-refresh", () => refreshAll(true));
+  click("btn-forget", forget);
+  click("btn-qr", () => openQr());
+  click("btn-qr-start", askQr);
+  click("btn-qr-close", cancelQr);
+  click("btn-qr-cancel", cancelQr);
+  click("btn-qr-poll", async () => {
+    if (!state.qrSession) return;
+    const receipt = await qrReceipt(state.qrSession.id);
+    if (receipt && !receipt.pending) await finishQr(state.qrSession.id, receipt, receipt.ok === true);
+  });
+  click("btn-run", () => state.status === "connected" ? startRun("read.yml") : showDialog("connect-dialog"));
+  click("btn-run-now", () => startRun("read.yml"));
+  click("btn-warm-now", () => startRun("warm.yml"));
+  click("btn-stop", stopAll);
+  click("btn-empty-action", () => state.status === "connected" ? openQr() : showDialog("connect-dialog"));
+  for (const id of ["btn-settings", "btn-mobile-settings", "btn-plan-settings"]) click(id, () => state.status === "connected" ? openSettings() : showDialog("connect-dialog"));
+  click("btn-alert-action", async () => {
+    const button = $("btn-alert-action");
+    const account = state.accounts.find(item => item.id === button.dataset.id);
+    if (button.dataset.action === "capture") { await sendInstruction("capture", { account_id: button.dataset.id }); say("阅读参数已自动更新。", "ok"); }
+    else openQr(account?.label || "");
+  });
+  click("btn-delete-confirm", deleteAccount);
+  click("btn-test-mail", async () => { await sendInstruction("test-mail", {}); say("测试邮件已发送。", "ok"); });
+  click("btn-test-push", async () => {
+    const channel = $("inp-test-channel").value;
+    if (!channel) throw new Error("选一个推送渠道并保存后测试。");
+    await sendInstruction("test-push", { channel }); say("测试推送已发送。", "ok");
+  });
+  submit("connect-form", "btn-connect", connect);
+  submit("edit-form", "btn-edit-save", saveAccount);
+  submit("schedule-form", "btn-schedule", async () => { await sendInstruction("schedule", { enabled: $("inp-auto-enabled").checked, warm_hours: $("inp-warm-enabled").checked ? 6 : 0 }); say("自动计划已保存。", "ok"); });
+  submit("notify-form", "btn-notify", saveNotifications);
+  $("acc-body").addEventListener("click", async event => {
+    const button = event.target.closest("button[data-act]");
+    if (!button || button.disabled || state.accountActions.has(button.dataset.id)) return;
+    const id = button.dataset.id, epoch = state.epoch;
+    state.accountActions.add(id);
+    button.disabled = true;
+    try { await accountAction(button); } catch (error) { reportError(error); }
+    finally {
+      if (current(epoch)) { state.accountActions.delete(id); renderAll(); }
+    }
+  });
+  for (const link of document.querySelectorAll(".tabs a")) link.addEventListener("click", () => {
+    for (const tab of document.querySelectorAll(".tabs a")) tab.removeAttribute("aria-current");
+    link.setAttribute("aria-current", "location");
+  });
+}
 function restore() {
   $("inp-repo").value = state.cfg.repo || "";
   $("inp-token").value = state.cfg.token || "";
+  $("inp-statekey").value = state.cfg.stateKeyText || "";
   $("inp-branch").value = state.cfg.branch || "wxread-state";
-  const keyText = localStorage.getItem("wxread.statekey");
-  if (keyText) {
-    $("inp-statekey").value = keyText;
-    try {
-      state.stateKey = c.stateKeyFromBase64(keyText);
-    } catch {
-      say("本机保存的状态密钥无法解析，请重新填。", "warn");
-    }
-  }
-  if (state.cfg.repo && state.cfg.token && state.stateKey) connect().catch(() => {});
+  $("inp-remember").checked = Boolean(state.cfg.remember);
+  renderAll();
+  if (state.cfg.token && state.cfg.stateKeyText) connect(true).catch(reportError);
 }
-
 bind();
 restore();
+setInterval(() => {
+  if (state.expiresAt && Date.now() >= state.expiresAt) { forget(); say("记住连接已到24小时，重新连接后继续。", "warn"); }
+  updateConnection();
+}, 1000);

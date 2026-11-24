@@ -23,6 +23,7 @@ STATUSES = (STATUS_OK, STATUS_NEEDS_LOGIN, STATUS_STOPPED)
 LABEL_MAX_LEN = 24
 REQUIRED_PAYLOAD_FIELDS = ("appId", "ps", "pc")
 PROMOTED_PAYLOAD_FIELDS = ("appId", "ps", "pc", "ci", "co", "sm", "pr", "b", "c")
+NUMERIC_PAYLOAD_FIELDS = ("ci", "co", "pr")
 
 _COOKIE_HEADER = re.compile(r"-H\s+'([Cc]ookie):\s*([^']+)'")
 _COOKIE_FLAG = re.compile(r"(?:-b|--cookie)\s+'([^']+)'")
@@ -49,7 +50,7 @@ def utcnow_iso() -> str:
 
 
 def _clean_label(label: str | None) -> str:
-    text = (label or "").strip()
+    text = str(label or "").strip()
     return text[:LABEL_MAX_LEN]
 
 
@@ -70,6 +71,16 @@ def clamp_target_count(value: Any) -> int:
     except (TypeError, ValueError) as exc:
         raise AccountError(f"target_count 不是整数：{value!r}") from exc
     return max(MIN_TARGET_COUNT, min(MAX_TARGET_COUNT, count))
+
+
+def normalize_read_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """保留请求字段类型，兼容旧扫码记录中被转为字符串的整数。"""
+    result = dict(payload)
+    for key in NUMERIC_PAYLOAD_FIELDS:
+        value = result.get(key)
+        if isinstance(value, str) and value.lstrip("-").isdigit():
+            result[key] = int(value)
+    return result
 
 
 @dataclass
@@ -96,7 +107,7 @@ class Account:
             raise AccountError("账户数据必须是对象")
         cookies = dict(payload.get("cookies") or {})
         headers = dict(payload.get("headers") or {})
-        read_payload = dict(payload.get("read_payload") or {})
+        read_payload = normalize_read_payload(payload.get("read_payload") or {})
         resolved_id = str(payload.get("id") or account_id or "")
         if not resolved_id:
             resolved_id = derive_account_id(cookies)
@@ -171,6 +182,8 @@ class Account:
     def mark_ok(self, when: str | None = None) -> None:
         self.last_ok_at = when or utcnow_iso()
         self.status = STATUS_OK
+        self.note = ""
+        self.extra.update({"warm_failures": 0, "warm_notified": False})
 
     def mark_needs_login(self, note: str = "") -> None:
         self.status = STATUS_NEEDS_LOGIN
@@ -186,6 +199,7 @@ class Account:
             self.label = other.label
         if other.status == STATUS_OK:
             self.status = STATUS_OK
+            self.extra.update({"warm_failures": 0, "warm_notified": False})
         self.renewed_at = other.renewed_at or self.renewed_at
 
 

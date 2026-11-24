@@ -118,8 +118,8 @@ def test_delete_removes_account(store: StateStore):
 
 def test_schedule_and_notifications_are_sanitized(store: StateStore):
     ctx = make_store(store)
-    scheduled = control.execute(ctx, instr("schedule", {"daily": "3:7", "warm_hours": 6}, sid="l" * 32))
-    assert scheduled["ok"] and scheduled["schedule"]["daily"] == "03:07"
+    scheduled = control.execute(ctx, instr("schedule", {"daily": "1:7", "warm_hours": 6}, sid="l" * 32))
+    assert scheduled["ok"] and scheduled["schedule"]["daily"] == "01:07"
 
     bad = control.execute(ctx, instr("schedule", {"warm_hours": 5}, sid="m" * 32))
     assert bad["ok"] is False

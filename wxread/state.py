@@ -15,10 +15,12 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import logging
+from copy import deepcopy
 from datetime import datetime, timezone
-from typing import Any, Iterable, Mapping, Protocol, runtime_checkable
+from typing import Any, Callable, Iterable, Mapping, Protocol, runtime_checkable
 
 import requests
 
@@ -116,6 +118,23 @@ class GitHubContents:
     def _url(self, path: str) -> str:
         return f"{self._api}/repos/{self.repo}/contents/{path.lstrip('/')}"
 
+    def run_created_at(self, run_id: str) -> int:
+        """GitHub 接收本次运行的时间，包含 runner 排队之前的时刻。"""
+        if not str(run_id).isdigit():
+            raise StateReadError("GITHUB_RUN_ID 不是合法运行编号")
+        try:
+            response = self._session.get(
+                f"{self._api}/repos/{self.repo}/actions/runs/{run_id}", timeout=self._timeout
+            )
+            if response.status_code != 200:
+                raise StateReadError(f"读取运行时间失败：HTTP {response.status_code}")
+            created = datetime.fromisoformat(response.json()["created_at"].replace("Z", "+00:00"))
+        except (requests.RequestException, KeyError, ValueError, TypeError) as exc:
+            raise StateReadError("无法读取 GitHub 接收运行的时间") from exc
+        if created.tzinfo is None:
+            raise StateReadError("GitHub 运行时间缺少时区")
+        return int(created.timestamp())
+
     def ensure_branch(self, source: str = "main") -> None:
         """分支不存在时从 source 创建（空仓库则无从创建，抛 StateError）。"""
         ref_url = f"{self._api}/repos/{self.repo}/git/ref/heads/{self.branch}"
@@ -139,7 +158,10 @@ class GitHubContents:
     # -- 接口
 
     def get(self, path: str) -> tuple[bytes | None, str | None]:
-        resp = self._session.get(self._url(path), params={"ref": self.branch}, timeout=self._timeout)
+        try:
+            resp = self._session.get(self._url(path), params={"ref": self.branch}, timeout=self._timeout)
+        except requests.RequestException as exc:
+            raise StateReadError(f"读取 {path} 网络失败：{type(exc).__name__}") from exc
         if resp.status_code == 404:
             return None, None
         if resp.status_code != 200:
@@ -155,7 +177,10 @@ class GitHubContents:
         return raw, payload.get("sha")
 
     def list(self, directory: str) -> list[str]:
-        resp = self._session.get(self._url(directory), params={"ref": self.branch}, timeout=self._timeout)
+        try:
+            resp = self._session.get(self._url(directory), params={"ref": self.branch}, timeout=self._timeout)
+        except requests.RequestException as exc:
+            raise StateReadError(f"列目录 {directory} 网络失败：{type(exc).__name__}") from exc
         if resp.status_code == 404:
             return []
         if resp.status_code != 200:
@@ -183,7 +208,10 @@ class GitHubContents:
             body["sha"] = sha
         elif create_only:
             headers["If-None-Match"] = "*"
-        resp = self._session.put(self._url(path), json=body, headers=headers, timeout=self._timeout)
+        try:
+            resp = self._session.put(self._url(path), json=body, headers=headers, timeout=self._timeout)
+        except requests.RequestException as exc:
+            raise Conflict(f"写入 {path} 响应中断：{type(exc).__name__}") from exc
         if resp.status_code in (409, 412, 422):
             raise Conflict(f"写入 {path} 冲突：HTTP {resp.status_code}")
         if resp.status_code not in (200, 201):
@@ -292,6 +320,34 @@ class StateStore:
         data = json.dumps(envelope, ensure_ascii=False, sort_keys=True).encode("utf-8")
         self._cas_write(path, data, message, create_only=create_only, sealed=True)
 
+    def mutate_encrypted(
+        self,
+        path: str,
+        update: Callable[[dict | None], Mapping[str, Any] | None],
+        message: str,
+    ) -> dict | None:
+        """在与 sha 对应的最新明文上变更，冲突后重新计算变更。"""
+        self.ensure_ready()
+        for _attempt in range(self.retries):
+            raw, sha = self.backend.get(path)
+            try:
+                current = self._decrypt(json.loads(raw.decode("utf-8")), path) if raw is not None else None
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise StateReadError(f"{path} 密文容器不是合法 JSON") from exc
+            updated = update(deepcopy(current))
+            if updated is None or updated == current:
+                return updated
+            envelope = crypto.encrypt_state(updated, self._keys[self.key_version], self._ctx(self.key_version), self.key_version)
+            data = json.dumps(envelope, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            try:
+                self.backend.put(path, data, message, sha=sha, create_only=sha is None)
+                return dict(updated)
+            except Conflict:
+                saved, _ = self.backend.get(path)
+                if saved == data:
+                    return dict(updated)
+        raise StateWriteError(f"{path} 变更失败（{self.retries} 次并发重试）")
+
     def _cas_write(self, path: str, data: bytes, message: str, create_only: bool, sealed: bool = False) -> None:
         self.ensure_ready()
         last_error: Exception | None = None
@@ -345,6 +401,9 @@ class StateStore:
     def save_settings(self, settings: Mapping[str, Any]) -> None:
         self.write_encrypted(SETTINGS_PATH, settings, "chore(state): settings")
 
+    def mutate_settings(self, update: Callable[[dict], dict]) -> dict:
+        return self.mutate_encrypted(SETTINGS_PATH, lambda current: update(current or {}), "chore(state): settings") or {}
+
     # -- accounts
 
     @staticmethod
@@ -357,6 +416,9 @@ class StateStore:
 
     def load_account(self, account_id: str) -> dict | None:
         return self.read_encrypted(self.account_path(account_id))
+
+    def mutate_account(self, account_id: str, update: Callable[[dict | None], Mapping | None], message: str) -> dict | None:
+        return self.mutate_encrypted(self.account_path(account_id), update, message)
 
     def load_accounts(self) -> dict[str, dict]:
         result: dict[str, dict] = {}
@@ -379,6 +441,39 @@ class StateStore:
             raise StateError("账户缺少 id")
         text = message or f"chore(state): account {account_id}"
         self.write_encrypted(self.account_path(str(account_id)), account, text)
+
+    def save_account_runtime(self, account: Mapping[str, Any], baseline: Mapping | None, message: str) -> dict | None:
+        """合并运行时字段，保留同期控制指令的修改与重新绑定的凭据。"""
+        previous = baseline or {}
+        fields = ("cookies", "renewed_at", "last_ok_at", "status", "note", "progress", "warm_failures", "warm_notified")
+
+        def update(current: dict | None) -> dict | None:
+            if current is None:
+                return dict(account) if baseline is None else None
+            credential_changed = any(current.get(name) != previous.get(name) and current.get(name) != account.get(name) for name in ("cookies", "headers", "read_payload", "credential_revision"))
+            for name in fields:
+                if name not in account or account.get(name) == previous.get(name):
+                    continue
+                if credential_changed and name in {"cookies", "renewed_at", "last_ok_at", "status", "note", "warm_failures", "warm_notified"}:
+                    continue
+                value = account[name]
+                old = previous.get(name)
+                if isinstance(value, dict):
+                    existing = dict(current.get(name) or {})
+                    old = old if isinstance(old, dict) else {}
+                    if name == "progress" and value.get("run_id") != old.get("run_id"):
+                        if existing.get("run_id") == old.get("run_id"):
+                            current[name] = dict(value)
+                        continue
+                    for key, item in value.items():
+                        if item != old.get(key) and existing.get(key) == old.get(key):
+                            existing[key] = item
+                    current[name] = existing
+                elif current.get(name) == old:
+                    current[name] = value
+            return current
+
+        return self.mutate_account(str(account["id"]), update, message)
 
     def delete_account(self, account_id: str, message: str | None = None) -> None:
         path = self.account_path(account_id)
@@ -405,10 +500,26 @@ class StateStore:
     def append_run(self, record: Mapping[str, Any], keep: int = RUNS_KEEP) -> None:
         started_at = str(record.get("started_at") or utcnow_iso())
         month = started_at[:7]
-        records = self.load_runs(month)
-        records.insert(0, dict(record))
-        del records[max(keep, 1) :]
-        self.write_encrypted(self._runs_path(month), {"month": month, "runs": records}, "chore(state): runs")
+        saved_record = dict(record)
+        saved_record.setdefault("started_at", started_at)
+        identity = saved_record.get("run_id") or hashlib.sha256(
+            json.dumps(saved_record, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        ).hexdigest()
+        saved_record["run_id"] = identity
+
+        def append(current: dict | None) -> dict:
+            current = current or {"month": month, "runs": []}
+            records = current.get("runs")
+            if not isinstance(records, list):
+                raise StateReadError(f"runs/{month} 结构异常")
+            if any(item.get("run_id") == identity for item in records):
+                return current
+            records.insert(0, saved_record)
+            records.sort(key=lambda item: str(item.get("started_at", "")), reverse=True)
+            del records[max(keep, 1) :]
+            return {"month": month, "runs": records}
+
+        self.mutate_encrypted(self._runs_path(month), append, "chore(state): runs")
 
     def recent_runs(self, limit: int = 20, months: Iterable[str] | None = None) -> list[dict]:
         if months is None:

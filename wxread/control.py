@@ -11,12 +11,14 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping
+from uuid import uuid4
 
 from . import notify, qr
-from .accounts import Account, account_from_curl, clamp_target_count
+from .accounts import Account, MissingFieldsError, account_from_curl, clamp_target_count, normalize_read_payload
 from .crypto import CryptoFailure, b64d, b64e, seal, unseal
 from .logsafe import scrub
 from .state import StateError, StateStore, utcnow_iso
@@ -26,6 +28,8 @@ log = logging.getLogger(__name__)
 ACTIONS = (
     "init",
     "qr",
+    "capture",
+    "stop",
     "import",
     "update",
     "delete",
@@ -59,6 +63,8 @@ class Instruction:
         session_id = str(data.get("session_id") or "")
         if not action or not session_id:
             raise ControlError("指令缺少 action/session_id")
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", session_id):
+            raise ControlError("session_id 只能包含字母、数字、下划线与短横线")
         try:
             issued_at = int(data.get("issued_at") or 0)
         except (TypeError, ValueError) as exc:
@@ -106,6 +112,7 @@ class ControlContext:
     qr_page_factory: Callable[[], qr.LoginPage] | None = None
     qr_timeout: float = qr.DEFAULT_TIMEOUT
     qr_out: Callable[[qr.QrShot], None] | None = None
+    qr_progress: Callable[[dict], None] | None = None
     notify_send: Callable[..., list] | None = None
 
 
@@ -170,11 +177,14 @@ def handle_qr(ctx: ControlContext, payload: Mapping[str, Any]) -> dict:
         )
         if not result.ok:
             return {"ok": False, "reason": result.reason, "qr_count": len(result.shots)}
+        if ctx.qr_progress:
+            ctx.qr_progress({"stage": "capturing", "message": "登录已确认，正在获取阅读参数"})
         cookies = page.cookies()
         payload_defaults = dict(payload.get("read_payload") or {})
         captured, capture_headers = _capture_read_payload(page)
+        cookies.update(page.cookies())
         read_payload = dict(payload_defaults)
-        read_payload.update({k: v for k, v in captured.items() if v})
+        read_payload.update({k: v for k, v in captured.items() if v is not None and str(v).strip()})
         headers = {"User-Agent": page.user_agent()}
         headers.update(capture_headers)
         account = qr.account_from_cookies(
@@ -186,40 +196,81 @@ def handle_qr(ctx: ControlContext, payload: Mapping[str, Any]) -> dict:
             now_iso=ctx.now_iso(),
         )
         account.mark_renewed(cookies.get("wr_skey", ""), ctx.now_iso())
-        existing = ctx.store.load_account(account.id)
-        if existing:
-            merged = _merge_accounts(existing, account)
-            # 上次扫码留下的"缺 ps/pc"提示，这次抓到参数就该撤掉
-            if merged.read_payload.get("ps") and merged.read_payload.get("pc") and merged.note == qr.PAYLOAD_HINT:
+        rebound = False
+
+        def bind(existing: dict | None) -> dict:
+            nonlocal rebound
+            rebound = existing is not None
+            merged = _merge_accounts(existing, account) if existing is not None else account
+            if merged.read_payload.get("ps") and merged.read_payload.get("pc"):
                 merged.note = ""
-            ctx.store.save_account(merged.to_dict(), message="control: qr rebind")
-        else:
-            ctx.store.save_account(account.to_dict(), message="control: qr bind")
+            merged.extra["credential_revision"] = uuid4().hex
+            return merged.to_dict()
+
+        saved = ctx.store.mutate_account(account.id, bind, "control: qr bind")
         return {
             "ok": True,
             "account_id": account.id,
-            "label": account.label,
-            "rebound": bool(existing),
+            "label": saved["label"],
+            "rebound": rebound,
             "payload_captured": bool(captured),
         }
     finally:
         page.close()
 
 
-def _capture_read_payload(page: Any) -> tuple[dict[str, str], dict[str, str]]:
+def _capture_read_payload(page: Any) -> tuple[dict[str, Any], dict[str, str]]:
     """登录态下顺手把 `web/book/read` 的参数抓回来（抓不到就算了，不打断扫码）。"""
     capture = getattr(page, "capture_read_payload", None)
     if not callable(capture):
         return {}, {}
     try:
         captured, headers = capture()
-    except Exception as exc:  # noqa: BLE001 - 抓包失败只能退回手工补
-        log.warning("自动抓取阅读参数失败：%s", exc)
+    except Exception as exc:  # noqa: BLE001 - 捕获失败后可用已保存登录态自动重试
+        log.warning("自动抓取阅读参数失败：%s", scrub(str(exc)))
         return {}, {}
     if not captured:
         log.warning("自动抓取阅读参数失败：页面没有发出 web/book/read")
         return {}, {}
     return dict(captured), dict(headers or {})
+
+
+def handle_capture(ctx: ControlContext, payload: Mapping[str, Any]) -> dict:
+    """使用已保存的登录态自动重新获取阅读参数。"""
+    account_id = str(payload.get("account_id") or "")
+    existing = ctx.store.load_account(account_id)
+    if existing is None:
+        raise ControlError("账户不存在")
+    account = Account.from_dict(existing)
+    factory = ctx.qr_page_factory or (lambda: qr.ChromeLoginPage(initial_cookies=account.cookies))
+    page = factory()
+    try:
+        page.open()
+        captured, headers = _capture_read_payload(page)
+        if not captured:
+            return {"ok": False, "account_id": account_id, "error": getattr(page, "capture_error", "") or "自动获取失败，可以重试", "reason": "capture_failed"}
+        cookies = page.cookies()
+        account.read_payload.update(captured)
+        account.headers.update({"User-Agent": page.user_agent(), **headers})
+        account.cookies.update(cookies)
+        account.mark_ok(ctx.now_iso())
+        account.mark_renewed(account.cookies.get("wr_skey", ""), ctx.now_iso())
+
+        def merge(current: dict | None) -> dict:
+            if current is None:
+                raise ControlError("账户已删除")
+            if any(current.get(name) != existing.get(name) for name in ("cookies", "headers", "read_payload", "credential_revision")):
+                raise ControlError("账户登录态已更新，刷新后重新自动取参")
+            merged = _merge_accounts(current, account)
+            merged.note = ""
+            merged.last_ok_at = account.last_ok_at
+            merged.extra["credential_revision"] = uuid4().hex
+            return merged.to_dict()
+
+        ctx.store.mutate_account(account_id, merge, "control: capture read payload")
+        return {"ok": True, "account_id": account_id, "payload_captured": True, "label": account.label}
+    finally:
+        page.close()
 
 
 def _merge_accounts(
@@ -251,47 +302,50 @@ def handle_import(ctx: ControlContext, payload: Mapping[str, Any]) -> dict:
         target_count=clamp_target_count(payload.get("target_count")),
         now=ctx.now_iso(),
     )
-    existing = ctx.store.load_account(account.id)
-    if existing:
-        # 用户显式导入：给了备注/目标就以这次为准，没给的沿用账户上的值
-        account = _merge_accounts(
-            existing,
-            account,
-            keep_label=not payload.get("label"),
-            take_target=bool(payload.get("target_count")),
-        )
-    ctx.store.save_account(account.to_dict(), message="control: import")
-    return {"ok": True, "account_id": account.id, "label": account.label, "updated": bool(existing)}
+    updated = False
+
+    def merge(existing: dict | None) -> dict:
+        nonlocal updated
+        updated = existing is not None
+        fresh = account
+        if existing is not None:
+            fresh = _merge_accounts(existing, account, keep_label=not payload.get("label"), take_target="target_count" in payload)
+        fresh.note = ""
+        return fresh.to_dict()
+
+    saved = ctx.store.mutate_account(account.id, merge, "control: import")
+    return {"ok": True, "account_id": account.id, "label": saved["label"], "updated": updated}
 
 
 def handle_update(ctx: ControlContext, payload: Mapping[str, Any]) -> dict:
     account_id = str(payload.get("account_id") or "")
     if not account_id:
         raise ControlError("update 需要 account_id")
-    raw = ctx.store.load_account(account_id)
-    if not raw:
-        raise ControlError(f"账户不存在 {account_id}")
-    account = Account.from_dict(raw)
-    if "label" in payload:
-        account.label = str(payload["label"])[:24]
-    if "target_count" in payload:
-        account.target_count = clamp_target_count(payload["target_count"])
-    if "enabled" in payload:
-        account.enabled = bool(payload["enabled"])
-    if "status" in payload:
-        status = str(payload["status"])
-        if status not in {"ok", "needs_login", "stopped"}:
-            raise ControlError(f"非法状态 {status}")
-        account.status = status
-    if "note" in payload:
-        account.note = str(payload["note"])[:200]
-    if "read_payload" in payload:
-        merged = dict(account.read_payload)
-        merged.update({k: str(v) for k, v in dict(payload["read_payload"]).items() if v})
-        account.read_payload = merged
-    account.validate()
-    ctx.store.save_account(account.to_dict(), message="control: update")
-    return {"ok": True, "account_id": account.id, "label": account.label}
+
+    def update(raw: dict | None) -> dict:
+        if raw is None:
+            raise ControlError(f"账户不存在 {account_id}")
+        account = Account.from_dict(raw)
+        if "label" in payload:
+            account.label = str(payload["label"])[:24]
+        if "target_count" in payload:
+            account.target_count = clamp_target_count(payload["target_count"])
+        if "enabled" in payload:
+            account.enabled = bool(payload["enabled"])
+        if "status" in payload:
+            status = str(payload["status"])
+            if status not in {"ok", "needs_login", "stopped"}:
+                raise ControlError(f"非法状态 {status}")
+            account.status = status
+        if "note" in payload:
+            account.note = str(payload["note"])[:200]
+        if "read_payload" in payload:
+            account.read_payload.update(normalize_read_payload(payload["read_payload"]))
+            account.validate()
+        return account.to_dict()
+
+    saved = ctx.store.mutate_account(account_id, update, "control: update")
+    return {"ok": True, "account_id": account_id, "label": saved["label"]}
 
 
 def handle_delete(ctx: ControlContext, payload: Mapping[str, Any]) -> dict:
@@ -300,52 +354,79 @@ def handle_delete(ctx: ControlContext, payload: Mapping[str, Any]) -> dict:
         raise ControlError("delete 需要 account_id")
     if not ctx.store.load_account(account_id):
         raise ControlError(f"账户不存在 {account_id}")
+    ctx.store.mutate_settings(lambda settings: {**settings, "legacy_import_disabled": True})
     ctx.store.delete_account(account_id, message="control: delete")
     return {"ok": True, "account_id": account_id, "deleted": True}
 
 
+def handle_stop(ctx: ControlContext, payload: Mapping[str, Any]) -> dict:
+    account_id = str(payload.get("account_id") or "")
+    run_id = str(payload.get("run_id") or "")
+
+    def stop(current: dict | None) -> dict:
+        if current is None:
+            raise ControlError("账户不存在")
+        progress = dict(current.get("progress") or {})
+        if not run_id or progress.get("run_id") != run_id or progress.get("status") != "running":
+            raise ControlError("当前运行已更新，刷新后重试")
+        progress["cancel_requested"] = True
+        current["progress"] = progress
+        return current
+
+    ctx.store.mutate_account(account_id, stop, "control: stop account run")
+    return {"ok": True, "account_id": account_id, "run_id": run_id}
+
+
 def handle_schedule(ctx: ControlContext, payload: Mapping[str, Any]) -> dict:
-    settings = ctx.store.load_settings()
-    schedule = dict(settings.get("schedule") or {})
-    if "enabled" in payload:
-        schedule["enabled"] = bool(payload["enabled"])
-    if payload.get("daily"):
-        hour, _, minute = str(payload["daily"]).partition(":")
-        if not hour.isdigit() or not minute.isdigit():
-            raise ControlError("daily 需形如 01:07")
-        schedule["daily"] = f"{int(hour):02d}:{int(minute):02d}"
-    if "warm_hours" in payload:
-        hours = int(payload["warm_hours"])
-        if hours not in (0, 1, 3, 6, 12):
-            raise ControlError("warm_hours 只允许 0/1/3/6/12")
-        schedule["warm_hours"] = hours
-    schedule.setdefault("daily", DEFAULT_DAILY)
-    schedule.setdefault("warm_hours", DEFAULT_WARM_HOURS)
-    settings["schedule"] = schedule
-    settings["updated_at"] = ctx.now_iso()
-    ctx.store.save_settings(settings)
-    return {"ok": True, "schedule": schedule}
+    def update(settings: dict) -> dict:
+        schedule = dict(settings.get("schedule") or {})
+        if "enabled" in payload:
+            schedule["enabled"] = bool(payload["enabled"])
+        if payload.get("daily"):
+            hour, separator, minute = str(payload["daily"]).partition(":")
+            if not separator or not hour.isdigit() or not minute.isdigit():
+                raise ControlError("daily 需形如 01:07")
+            if not 0 <= int(hour) <= 23 or not 0 <= int(minute) <= 59:
+                raise ControlError("daily 超出时间范围")
+            if f"{int(hour):02d}:{int(minute):02d}" != DEFAULT_DAILY:
+                raise ControlError("每日时间由read.yml固定为01:07，修改时间需修改工作流cron")
+        if "warm_hours" in payload:
+            hours = int(payload["warm_hours"])
+            if hours not in (0, DEFAULT_WARM_HOURS):
+                raise ControlError("保活由warm.yml固定为每6小时，可设置0关闭")
+            schedule["warm_hours"] = hours
+        schedule["daily"] = DEFAULT_DAILY
+        schedule["warm_hours"] = 0 if schedule.get("warm_hours") == 0 else DEFAULT_WARM_HOURS
+        settings["schedule"] = schedule
+        settings["updated_at"] = ctx.now_iso()
+        return settings
+
+    settings = ctx.store.mutate_settings(update)
+    return {"ok": True, "schedule": settings["schedule"]}
 
 
 def handle_notifications(ctx: ControlContext, payload: Mapping[str, Any]) -> dict:
-    settings = ctx.store.load_settings()
-    block = dict(settings.get("notifications") or {})
-    if "enabled" in payload:
-        block["enabled"] = bool(payload["enabled"])
-    if "channels" in payload:
-        channels = [str(item) for item in payload["channels"]]
-        unknown = [item for item in channels if item not in notify.CHANNELS]
-        if unknown:
-            raise ControlError(f"未知渠道 {unknown}")
-        block["channels"] = channels
-    for channel in notify.CHANNELS:
-        if channel in payload and isinstance(payload[channel], Mapping):
-            merged = dict(block.get(channel) or {})
-            merged.update(dict(payload[channel]))
-            block[channel] = merged
-    settings["notifications"] = block
-    settings["updated_at"] = ctx.now_iso()
-    ctx.store.save_settings(settings)
+    def update(settings: dict) -> dict:
+        block = dict(settings.get("notifications") or {})
+        if "enabled" in payload:
+            block["enabled"] = bool(payload["enabled"])
+        if "channels" in payload:
+            channels = [str(item) for item in payload["channels"]]
+            unknown = [item for item in channels if item not in notify.CHANNELS]
+            if unknown:
+                raise ControlError(f"未知渠道 {unknown}")
+            block["channels"] = channels
+        for channel in notify.CHANNELS:
+            if channel in payload and isinstance(payload[channel], Mapping):
+                merged = dict(block.get(channel) or {})
+                merged.update(dict(payload[channel]))
+                block[channel] = merged
+        settings["notifications"] = block
+        settings["updated_at"] = ctx.now_iso()
+        return settings
+
+    settings = ctx.store.mutate_settings(update)
+    block = settings["notifications"]
     safe = {k: ({"configured": True} if k in notify.CHANNELS else v) for k, v in block.items()}
     return {"ok": True, "notifications": safe}
 
@@ -367,6 +448,8 @@ def handle_test(ctx: ControlContext, payload: Mapping[str, Any], *, kind: str) -
 _HANDLERS: dict[str, Callable[[ControlContext, Mapping[str, Any]], dict]] = {
     "init": handle_init,
     "qr": handle_qr,
+    "capture": handle_capture,
+    "stop": handle_stop,
     "import": handle_import,
     "update": handle_update,
     "delete": handle_delete,
@@ -377,6 +460,16 @@ _HANDLERS: dict[str, Callable[[ControlContext, Mapping[str, Any]], dict]] = {
 }
 
 
+def _write_receipt(ctx: ControlContext, instruction: Instruction, receipt: Mapping[str, Any]) -> None:
+    envelope: dict = {"v": 0, "plain": dict(receipt)}
+    if instruction.reply_key:
+        try:
+            envelope = seal(receipt, b64d(instruction.reply_key))
+        except CryptoFailure as exc:
+            raise ControlError("回执公钥无效") from exc
+    ctx.store.write_response(instruction.session_id, envelope)
+
+
 def execute(
     ctx: ControlContext,
     instruction: Instruction,
@@ -384,34 +477,40 @@ def execute(
     now: int | None = None,
     skew: int = DEFAULT_SKEW,
 ) -> dict:
-    """校验 → 抢 session → 执行 → 写回执。返回回执明文（测试用），同时加密落盘。"""
-    check_action(instruction)
-    check_fresh(instruction, now=now, skew=skew)
-    try:
-        ctx.store.claim_session(
-            instruction.session_id,
-            {"action": instruction.action, "issued_at": instruction.issued_at, "claimed_at": ctx.now_iso()},
-        )
-    except StateError as exc:
-        raise ControlError(f"session 已被消费（重放防护）：{scrub(str(exc))}") from exc
-
+    """校验、消费会话、执行并写加密回执，拒绝的指令也产生失败回执。"""
     receipt: dict = {"ok": False, "action": instruction.action, "session_id": instruction.session_id, "at": ctx.now_iso()}
+    try:
+        check_action(instruction)
+        check_fresh(instruction, now=now, skew=skew)
+        try:
+            ctx.store.claim_session(
+                instruction.session_id,
+                {"action": instruction.action, "issued_at": instruction.issued_at, "claimed_at": ctx.now_iso()},
+            )
+        except StateError as exc:
+            raise ControlError(f"session 已被消费（重放防护）：{scrub(str(exc))}") from exc
+    except ControlError as exc:
+        receipt["error"] = scrub(str(exc))
+        if ctx.store.read_response(instruction.session_id) is None:
+            _write_receipt(ctx, instruction, receipt)
+        raise
+
+    previous_progress = ctx.qr_progress
+    if instruction.action == "qr":
+        ctx.qr_progress = lambda progress: _write_receipt(ctx, instruction, {**receipt, **progress, "pending": True})
     try:
         result = _HANDLERS[instruction.action](ctx, instruction.payload)
         receipt.update(result)
         receipt["ok"] = bool(result.get("ok", True))
+    except MissingFieldsError as exc:
+        receipt.update({"ok": False, "error": str(exc), "missing_fields": exc.fields})
     except ControlError as exc:
-        receipt.update({"ok": False, "error": str(exc)})
-    except Exception as exc:  # 任何未预期异常都必须变成回执，否则页面会一直等
+        receipt.update({"ok": False, "error": scrub(str(exc))})
+    except Exception as exc:
         receipt.update({"ok": False, "error": f"{type(exc).__name__}: {scrub(str(exc))}"})
-    envelope: dict = {"v": 0, "plain": receipt}
-    if instruction.reply_key:
-        try:
-            envelope = seal(receipt, b64d(instruction.reply_key))
-        except CryptoFailure as exc:
-            receipt["reply_error"] = str(exc)
-            envelope = {"v": 0, "plain": receipt}
-    ctx.store.write_response(instruction.session_id, envelope)
+    finally:
+        ctx.qr_progress = previous_progress
+    _write_receipt(ctx, instruction, receipt)
     return receipt
 
 

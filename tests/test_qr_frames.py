@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 import pytest
 
 from support import MemoryContents
@@ -77,3 +79,13 @@ def test_purge_tolerates_delete_failure(monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setattr(backend, "delete", boom)
 
     assert purge_stale_qr(store, "keep") == 0
+
+
+def test_purge_preserves_recent_claimed_scan_and_drops_expired_scan() -> None:
+    backend = MemoryContents()
+    store = make_store(backend)
+    for session, age in (("active", 0), ("expired", 45)):
+        store.claim_session(session, {"action": "qr", "claimed_at": (datetime.now(timezone.utc) - timedelta(minutes=age)).isoformat()})
+        store.put_raw(qr_frame_path(session, 1, "f" * 16), b"png", "fixture")
+    assert purge_stale_qr(store, "new") == 1
+    assert backend.list("responses") == ["qr-active-001-" + "f" * 16 + ".png"]

@@ -1,199 +1,283 @@
-# RUNBOOK：部署、日常运维与故障处置
+# 使用手册：从首次配置到每天自动阅读
 
-面向"自己用"的运维手册。所有命令都在仓库根目录执行；状态数据在 `wxread-state` 分支，不在 `main`。
+更新：2026-11-24。适用于本仓库当前的 wxread v4。已经部署的用户先看第 10 节，正常升级不需要重新生成密钥或重新添加账户。
 
-## 0. 系统长什么样
+## 1. 你需要做什么
 
-```
-浏览器(web/) --密文指令--> control.yml --> worker control
-                                            ├─ 写状态分支 accounts/*.enc.json / settings.enc.json
-                                            └─ 写回执 responses/<session>.json
-read.yml  (每天 01:07 北京) --> worker read  --> 状态分支 runs/*.enc.json + accounts/*.enc.json
-warm.yml  (每 6 小时)       --> worker warm  --> 只更新 accounts/*.enc.json 的 wr_skey
-```
+首次完成「GitHub 配置 → 扫码绑定 → 飞书测试 → 阅读验收」后，阅读和保活都在 GitHub Actions 运行。可以关闭控制台、浏览器和自己的电脑；每天北京时间 01:07 开始阅读，整批结束后向飞书发摘要。
 
-- 明文 cookie **只在** worker 进程内存里出现；仓库里只有 `crypto_secretbox` 密文。
-- 所有写入都是 Contents API + `sha`/`If-None-Match` CAS，冲突自动重试 3 次。
+无需导入 cURL。微信读书撤销登录或要求手机确认时，仍需在页面重新扫码。GitHub 调度可能延迟，01:07 是计划开始时间，消息要等阅读结束后才发。默认一个账户 40 次，每次成功请求按 30 秒折算，即目标 20 分钟，正常执行约 20 分钟再加启动与网络时间。
 
-## 1. 首次部署（约 10 分钟）
+入口：
 
-1. **建状态密钥**（本机执行一次，结果只存 Secret）：
+- 本项目控制台：[maroubao.github.io/wxread/](https://maroubao.github.io/wxread/)；根地址会转到 /web/。
+- GitHub 运行记录：[Actions](https://github.com/maroubao/wxread/actions)。
+- 自己 Fork 后，用自己仓库 Settings → Pages 显示的地址，仓库名填自己的 owner/repo。
+- 修改代码、升级、回滚和交接给其他维护者，读 [MAINTENANCE.md](MAINTENANCE.md)。
 
-   ```bash
-   python -c "import os,base64;print(base64.b64encode(os.urandom(32)).decode())"
-   ```
+## 2. 首次配置 GitHub
 
-2. **配置 Secrets**（仓库 Settings → Secrets and variables → Actions）：
+### 2.1 仓库与权限
 
-   | Secret | 说明 |
-   | --- | --- |
-   | `WXREAD_STATE_KEY` | 上一步的 base64，32 字节 |
-   | `WXREAD_CONTROL_SK` | 第 4 步本机 `keygen.py` 输出的私钥（base64） |
+1. 使用自己的仓库或 Fork。保留默认分支 main 和 .github/workflows/ 下的五个工作流。
+2. 进入仓库 Actions；如果提示工作流被禁用，点击启用。
+3. Settings → Actions → General：允许本项目使用 GitHub Actions。工作流需要写入内容的权限；本仓库的 read、warm、control 已声明 contents: write。组织策略不能把它降为只读。
+4. 状态分支默认为 wxread-state。不要给这个分支设置禁止机器人写入的保护规则，不要合并进 main。
+5. 若你的状态分支改了名字，在 Settings → Secrets and variables → Actions → Variables 新建 WXREAD_STATE_BRANCH。页面连接里的分支名称也填相同值。默认名字不必创建变量。
 
-3. **开 Pages**：Settings → Pages → Source 选 **GitHub Actions**（`pages.yml` 会部署 `web/`）。
+### 2.2 生成并保存两类密钥（仅首次）
 
-4. **生成指令密钥对（在本机，不在 CI）**：
+Windows 安装 Python 后，在仓库根目录用 PowerShell 执行：
 
-   ```bash
-   python scripts/keygen.py
-   # public_key=<base64>   → 下一步填进 workflow 输入
-   # private_key=<base64>  → 存进 Secret WXREAD_CONTROL_SK，只留在本机
-   ```
+~~~powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+New-Item -ItemType Directory -Path .secrets -Force
+.\.venv\Scripts\python.exe -c "import os,base64;from pathlib import Path;Path('.secrets/state-key.txt').write_text(base64.b64encode(os.urandom(32)).decode(),encoding='utf-8')"
+.\.venv\Scripts\python.exe scripts/keygen.py --out .secrets/control-keypair.json --quiet
+~~~
 
-   **私钥不能由 Actions 打印**：public 仓库的 Actions 日志是全网可读的。所以 `init` 只接收公钥：
+.secrets 目录已被 Git 忽略，先创建目录再运行 keygen。--quiet 只打印公钥，私钥在你指定的 JSON 文件里。打开这两个文件，按下表填写 GitHub 仓库 Settings → Secrets and variables → Actions → New repository secret：
 
-   Actions → `control` → Run workflow → `control = init`，把 `public_key` 贴进 `public_key` 输入框。日志会出现：
-
-   ```text
-   ::notice::control public_key=<base64> key_version=1
-   ```
-
-   `public_key` 写到状态分支 `control.json`（明文，公钥本就该公开）。换钥就再跑一次并填新公钥，旧私钥立即失效（日志会提示 `公钥已替换`）。
-
-5. **绑定第一个账户**（扫码就行，通常不用碰 cURL）：
-
-   - **扫码**：打开 Pages 站点 → 填仓库、token、状态密钥 → 点"连接并保存" → "扫码添加账户" → 微信扫。
-     扫完并确认登录后，worker 会在同一个浏览器里打开书架读一段，把站点自己发的
-     `web/book/read` 请求抓下来，`appId/ps/pc` 一并写进账户；面板自动收起，账户出现在下表。
-   - **导入 curl**（只在自动抓取没成功时用）：浏览器 F12 → Network → 复制 `web/book/read` 请求为 cURL →
-     控制台"导入 cURL"贴进去点导入（或本机 `scripts/control_local.py import --curl-file curl.txt`，见下）。
-
-   自动抓取失败一律有回音：回执里 `payload_captured=false`，页面提示"这次没抓到阅读参数"，
-   账户 `note` 标成"扫码账户未带 ps/pc"，这时才需要补一次 curl。常见原因是书架为空、
-   打开的那本是付费书、或书架 90 秒内没渲染出来。
-
-   导入用 `scripts/control_local.py`（终端下发密文指令，与网页按钮等价）：
-
-   ```bash
-   export GITHUB_TOKEN=<fine-grained: contents 读写 + actions 读写>
-   python scripts/control_local.py import --repo <owner>/<repo> \
-     --payload-json '{"curl":"<粘贴整段 cURL>","label":"主号","target_count":40}'
-   ```
-
-   cURL 太长就先存文件：`--payload-file import.json`（`{"curl": "...", "label": "主号"}`）。
-
-6. **第一条真跑**（见 §5 G3 清单）。
-
-## 2. 日常
-
-| 想做什么 | 怎么做 |
-| --- | --- |
-| 改每日目标次数 | 控制台账户行"编辑" → `update` 指令 |
-| 补 `appId/ps/pc`（自动抓取失败时才做） | 控制台"导入 cURL"：F12 里复制一条 `read` 请求整段贴进去 → 点"导入 / 更新 payload"。同一个 `wr_vid` 合并到已绑账户，不用重新扫码 |
-| 临时补读 | 控制台"最近运行"填间隔/截止 → "按上面的参数试读"（`read.yml`，页面里能看到排队中/进行中/成功并给出日志链接） |
-| 只保活一次 | 控制台"保活一次"（`warm.yml`） |
-| 关掉自动运行 | 控制台"计划"取消勾选，或直接 `schedule` 指令 `enabled: false`（cron 仍在，但 worker 开头就退出 0） |
-| 改保活间隔 | `schedule` 指令 `warm_hours: 0/1/3/6/12`；`0` 等于关闭（workflow 仍每 6 小时跑一次，只是空转） |
-| 加账户 | 再来一次扫码或导入 |
-| 填通知口令（SMTP/webhook/bot token） | 网页只能开关渠道，口令用脚本：`python scripts/control_local.py notifications --payload-json '{"enabled":true,"channels":["email"],"email":{"host":"smtp.qq.com","port":465,"user":"a@qq.com","password":"授权码","to":"a@qq.com"}}'` |
-| 停用某账户 | 账户行"停用"（`update enabled: false`），该账户不再参与 read/warm |
-
-## 3. 故障处置
-
-### 3.1 账户变成 `needs_login`
-
-含义：renewal 拿不到新 `wr_skey`，或读接口连续报会话错误。
-
-处置：控制台重新扫码（同 `wr_vid` 会合并到同一账户 id）；或重新导入 curl。
-
-```bash
-# 只看状态、不落盘（本机有 .qr-cookies.json 时）
-python scripts/live_check.py
-```
-
-### 3.2 `read.yml` 报 `state_error`（退出码 4）
-
-状态分支写不进去：token 权限不足、分支保护、或并发冲突耗尽重试。
-
-1. 确认 `read.yml` 的 `permissions: contents: write` 没被组织策略降级；
-2. 确认 `wxread-state` 分支没有开分支保护；
-3. 手动重跑一次；仍是 4 就查 `runs/<月>.enc.json` 里该条的 `exit_code`。
-
-### 3.3 阅读数为 0 但没有报错
-
-- 检查 `schedule.enabled` 是否为 false（worker 会打印 `::notice::read skipped`）；
-- 检查账户 `target_count` 与 `enabled`；
-- 检查 `runs/` 里该次记录 `reason`：`no_synckey` 表示服务端没下发同步键（reader 会自动补救一轮）。
-
-### 3.4 控制台"连接失败"
-
-- 401：token 过期或没勾 `contents: write` / `actions: write`；
-- 404：仓库名写错，或状态分支还没建（先跑 `control.yml` `init`）；
-- 页面能连但账户显示"（解不开）"：状态密钥填错，或跨仓库搬运（上下文前缀会拒绝，这是设计行为）。
-
-### 3.5 密钥轮换
-
-1. 新状态密钥 `K2` 写进 Secret `WXREAD_STATE_KEY`；
-2. 用旧密钥在 `WXREAD_KEYS="1:<旧b64>"` 下跑一次 `control`（`update` 任意账户即可），worker 会所有文件重写成 `K2`（`key_version` 递增）；
-3. 确认 `runs/`、`accounts/`、`settings` 都能读后，删掉 `WXREAD_KEYS`。
-
-> 当前实现：`StateStore(old_keys=...)` 已支持读旧版本，但**批量重写脚本尚未提供**（G3 待办）。轮换前先备份状态分支。
-
-### 3.6 二维码不出现
-
-1. Actions 里看 `control` 运行：`playwright install` 失败 → CI 网络问题，重跑；
-2. 日志有 `::notice::qr updated ...` 但页面不显示 → 点"刷新二维码"（页面只认本次会话的帧：
-   `responses/qr-<session_id>-<seq>-<指纹>.png`，序号保证按名字排序就是时间顺序）；
-3. 二维码出来了但扫码提示失效 → 点"刷新二维码"取最新一张（每 85 秒换码）。
-
-> 改了帧名规则之前留下的 `responses/qr-<指纹>.png` 会在下次点"扫码添加账户"时被
-> `worker.purge_stale_qr()` 删掉——那些是带方块浮层的旧图，不删就会继续被误当成新码。
->
-> **扫码成功后界面会自己收起**：`pollQr` 每轮先看 `responses/<session>.json` 回执，
-> 回执一到就收起二维码区、刷新账户表，不会一直轮询到 15 分钟预算。要再加账户才点
-> "扫码添加账户"重新展开；扫码中想放弃点"取消"（会顺手 cancel 那次 control 运行）。
-
-### 3.7 二维码上出现一排方块 / 扫不出来
-
-CI 的 headless Chrome 没装中文字体。二维码过期后微信读书会盖一层"点击刷新二维码"，那行汉字
-在容器里渲染成一串空方块，正好压在码上——所以第 3、4 张开始就扫不动。
-
-现在 `qr_png()` 优先读 `<img src="data:image/png;base64,...">` 的原始位图（干净、无文字、无浮层），
-只有取不到时才回落到截图。如果又看到方块，说明站点换了载体元素：把新的 selector 加进
-`wxread/qr.py` 的 `QR_SELECTORS`。
-
-**看到方块时先确认跑的是哪个提交**：workflow 用的是 dispatch 那一刻的 `main`，修复推送前点出去的
-那次运行会一直吐旧图，直到那次运行自己结束（最长 `qr_seconds`）。先 Cancel，再 Run workflow。
-
-### 3.8 扫完码提示"登录失败，请重新扫码"
-
-以前每 85 秒整页重开一次换新码，如果正好扫在换码前后，微信侧那次登录就被我们自己的刷新取消了。
-
-现在 `wait_for_login` 会先看页面是否出现"扫描成功 / 请在手机上确认"，一旦出现就**停止重开**，
-安静等手机确认。若仍然报失败：把 `qr_seconds`（默认 600）调大，扫完别急着关页面。
-
-## 4. 回滚
-
-- **代码**：`git revert <commit>`（状态分支不受影响，数据在 `wxread-state`）。
-- **状态**：状态分支是普通 git 分支，`git checkout wxread-state && git revert <bad-commit>` 即可回到上一份密文。
-- **彻底停用**：删掉 `read.yml`/`warm.yml` 的 schedule 触发器，或把 `WXREAD_STATE_KEY` 换成一个新随机值（旧密文立刻解不开）。
-
-## 5. G3 真跑清单（上线验收）
-
-按顺序做，每步都有明确的通过标准：
-
-| # | 动作 | 通过标准 |
+| 名称 | 填什么 | 用途 |
 | --- | --- | --- |
-| 1 | `control.yml` `init` | 日志出现 `public_key`；状态分支出现 `control.json` |
-| 2 | 控制台连接 | 头部 chip 变"已连接"，账户区显示空状态而不是报错 |
-| 3 | 扫码（真实微信） | 账户出现且 `status=ok`；`renewed_at` 有值 |
-| 4 | 阅读参数（应自动完成） | 扫码回执 `payload_captured=true`，账户 `read_payload` 里有 `appId/ps/pc` 且 `note` 为空；为 `false` 时用 `scripts/control_local.py import` 补一次 |
-| 5 | 手动 `read.yml`（`pace=3`，`target_count=3`） | `runs/` 出现记录，`read_count=3`，`succ` 分布在日志里，退出码 0 |
-| 6 | 每日定时 | 次日 01:07 后 `runs/` 有当天记录 |
-| 7 | `warm.yml` 手动 | 账户 `renewed_at` 前移，`wr_skey` 变化（8 位短码可能不变，看 `renewed_at`） |
-| 8 | 通知 `test-mail` / `test-push` | 回执 `ok: true`，邮箱/群里收到消息 |
-| 9 | 故意改坏 cookie 跑 `warm` | 该账户变 `needs_login`，其它账户不受影响 |
-| 10 | 控制台"停用"再"立即运行" | 该账户被跳过，`runs` 里没有它的记录 |
-| 11 | Pages 站点 800px 宽 + 键盘 Tab | 无横向滚动；Tab 能走到每个按钮并有可见焦点环 |
-| 12 | `tests.yml` | pytest / node / compileall / 密钥扫描四步全绿 |
+| WXREAD_STATE_KEY | state-key.txt 的完整内容 | 加解密账户、设置和历史；页面连接也需要同一值 |
+| WXREAD_CONTROL_SK | control-keypair.json 的 private_key 值 | Actions 解密管理指令；不用填进页面 |
+| FEISHU_WEBHOOK | 可选：已有机器人的完整 Webhook | 兼容旧部署；新部署建议直接在页面保存飞书配置 |
 
-## 6. 本地开发
+public_key 是公钥，供下一步初始化。它不能代替 private_key，也不能代替 WXREAD_STATE_KEY。三者分别保存，不要贴到公开 issue、PR、日志或截图中。备份 .secrets 中的原件到你自己的安全位置。
 
-```bash
-python -m pytest tests -q                 # 104 passed
-node --test tests/js/crypto.test.mjs      # 4 passed（跨语言加密互通）
-python scripts/scan_secrets.py            # 明文密钥扫描
-python scripts/qr_local.py --wait 300     # 本机真扫码（写 .qr-cookies.json，已 gitignore）
-python scripts/control_local.py --help    # 本机下发密文指令（import / notifications 等）
-python -m wxread.worker read --verbose    # 需要 GITHUB_* 与 WXREAD_STATE_KEY
-```
+正常升级不要再次执行生成密钥的命令。GitHub 的 Secret 值保存后不能从设置页读回来，因此需要保留自己的原件。
+
+### 2.3 初始化控制入口
+
+1. Actions → control → Run workflow，分支选 main。
+2. control 选 init；public_key 填 control-keypair.json 中的 public_key 值；其他输入留空或保持默认。
+3. 运行完成后应为绿色。状态分支会出现 control.json，其内容是公钥和版本。
+4. 如果已有账户且控制台可连接，跳过这一步。重复填同一公钥不会重建账户；更换公钥属于密钥轮换，不属于普通升级。
+
+### 2.4 发布页面
+
+Settings → Pages → Build and deployment → Source 选择 GitHub Actions。然后 Actions → pages → Run workflow → main。
+
+pages 作业成功后，打开 Settings → Pages 给出的地址。看到「阅读总览」「账户」「运行记录」「每日计划」即为新版。页面初次没有账户是正常状态，接下来连接并扫码。
+
+### 2.5 创建用于控制台的 GitHub token
+
+GitHub 头像 → Settings → Developer settings → Personal access tokens → Fine-grained tokens → Generate new token：
+
+1. Resource owner 选仓库拥有者。
+2. Repository access 只选择这个仓库。
+3. Repository permissions：Contents 为 Read and write，Actions 为 Read and write；Metadata 随 GitHub 自动配置。
+4. 选择适当的有效期并保存 token。组织仓库可能需要审批，审批完成后才能连接。
+
+控制台 token 只负责查看状态、发起和取消任务。自动阅读使用 Actions 自带的 GITHUB_TOKEN，控制台 token 过期不会让每日阅读停止。修改工作流代码的维护者需要另有相应的仓库/Workflows 写权限。
+
+## 3. 连接控制台
+
+点击「连接仓库」或「连接设置」，填写：
+
+| 字段 | 示例 / 含义 |
+| --- | --- |
+| 仓库 | maroubao/wxread，Fork 后换成自己的 owner/repo |
+| GitHub token | 第 2.5 节生成的完整 token |
+| 状态密钥 | 与 Secret WXREAD_STATE_KEY 完全一致 |
+| 状态分支 | 展开「状态分支」；默认 wxread-state |
+| 记住连接 24 小时 | 默认不选；选中才在当前浏览器保存 24 小时 |
+
+点击「连接」。头部显示仓库名，账户和计划载入，即连接成功。
+
+默认只在当前页面会话使用凭据，刷新或重新打开需要再连接。选择记住后，24 小时到期会清除保存值。它只影响页面使用，和云端每天自动阅读无关。
+
+「刷新」重新读取 GitHub 状态。「断开连接」停止本页轮询、清除本机保存的 token/状态密钥和敏感表单；云端的账户、计划及已经运行的任务继续存在。真正暂停云端运行见第 6 节。
+
+## 4. 扫码添加、重新绑定与自动取参
+
+首次先在微信读书书架放至少一本可以打开正文的书，优先免费书或你已拥有阅读权限的书。空书架、付费墙、验证弹窗会阻止自动取参。
+
+1. 点击「添加账户」。
+2. 填「账户备注」，例如「主号」，最多 24 字。
+3. 点击「生成二维码」。GitHub 启动和安装依赖期间页面显示等待，通常需要几十秒到数分钟。
+4. 用该账户的微信扫描当前页面的二维码，在手机上确认登录。二维码过期会自动更新，使用最新一张。
+5. 页面显示「登录已确认，正在获取阅读参数」后，等待程序自动打开正文并确认阅读请求。此时不需要再次扫码。
+6. 最终弹窗收起，账户出现在表中，状态正常；可以直接运行。
+
+扫码默认等待 10 分钟，页面跟踪预算 15 分钟。已经扫描、等待手机确认时，程序会等待确认，避免换码打断登录。
+
+| 情况 | 处理 |
+| --- | --- |
+| 二维码尚未出现 | 等待当前 control 作业启动；在 Actions 看是否排队或安装失败 |
+| 手机提示二维码过期 / 登录失败 | 不再扫旧图；取消本次绑定后重新生成并扫描当前图 |
+| 想放弃扫码 | 「取消本次绑定」、窗口关闭按钮或 Esc；只取消本次会话的 control |
+| 想看最新进度 | 「刷新状态」读取本次回执；它不承诺立即生成新二维码 |
+| 登录已保存但自动取参未完成 | 页面会使用已保存登录态自动重试；失败后账户行出现「取参」，点击重试 |
+| 取参仍失败 | 在自己的微信读书确认书能打开正文，再点取参；登录失效则重新扫码 |
+| 账户显示「需重新绑定」 | 点行内「重绑」或总览的「重新绑定」，用相同微信号扫码 |
+
+同一个微信读书账号重新绑定会更新同一账户的凭据，保留已有备注、目标和启用设置，不会产生重复账户。扫码其他微信号会添加另一个账户。保留停用状态的账户重新扫码后仍需在编辑里勾选参与每日阅读。
+
+## 5. 页面各功能怎么用
+
+### 5.1 总览和记录的口径
+
+| 区域 | 含义 |
+| --- | --- |
+| 今日阅读 | 北京时间当天的成功请求折算分钟数，包含已经写入的运行进度；同一运行的进度和最终记录不会重复计算 |
+| 可运行目标 / 还差 | 当前启用、参数齐全、登录正常的账户目标总和 / 当天不足的部分 |
+| 账户 | 总账户数、可运行数、今日已达标数 |
+| 近 7 日成功率 | 成功完成目标的运行数 / 有结果的运行数；恢复后完成目标也算成功 |
+| 需重新绑定 | 需要手机重新确认登录的账户数 |
+| 账户「今日 / 目标」 | 当天累积读取量 / 该账户目标；一天手动运行多次可能超过目标 |
+| 最近成功 | 最近一次成功读取时间，展示北京时间 |
+| 续期 | 最近一次成功续期距现在多久；悬停可看完整时间 |
+| 运行记录 | 最近最多 100 条已读取记录；本次/目标、结果和耗时，按最新时间排序 |
+| 近 7 日阅读柱图 | 按账户累计成功读取量；没有记录与有记录但读取为零会分别表示 |
+| 下次运行 | 按固定计划估算；实际排队与 GitHub 调度延迟以 Actions 为准 |
+| 上次同步 | 本页读取 GitHub 状态的时间，不能作为阅读已经完成的证据 |
+
+分钟是成功请求数 × 0.5 的显示值。微信读书客户端展示和活动统计可能存在延迟；首次验收同时在微信读书里确认阅读记录。GitHub 作业绿色也可能是跳过或部分成功，应同时看账户结果和飞书摘要。
+
+### 5.2 账户操作
+
+「还差」按各账户的缺口累加，某个账户的超额阅读不会抵扣其他账户尚未达到的目标。
+
+旧 Secret 的自动导入只用于首次迁移。删除账户后不会因为旧 Secret 仍在而自动重建，重新使用要显式扫码。
+
+桌面行内按钮悬停有说明，也可用 Tab 聚焦读取名称；手机显示同样的操作。
+
+| 操作 | 怎么做 | 结果 |
+| --- | --- | --- |
+| 运行一个账户 | 点击该行的 ▶ | 只运行该账户，其他账户不会跟着读 |
+| 运行全部 | 总览「运行全部」 | 运行所有启用且正常的账户，异常账户列在汇总里 |
+| 编辑 | 行内编辑按钮 | 修改备注、每日目标、是否参与；点保存，等确认 |
+| 目标 | 编辑 → 每日目标（分钟） | 0.5～100 分钟，步长 0.5；20 分钟为 40 次，21.5 分钟为 43 次 |
+| 停用 | 编辑 → 取消「参与每日阅读」→ 保存 | 后续自动/手动批次跳过该账户，也不保活；已有任务在检查控制状态后停止 |
+| 恢复 | 编辑 → 勾选参与每日阅读 → 保存 | 后续重新参与；登录失效仍需扫码 |
+| 停止一个账户 | 运行中该行的 ■ | 对该账户当前 run_id 请求停止，保留已读进度 |
+| 全部停止 | 账户区「全部停止」 | 取消当前仓库排队或运行中的 read 工作流，不取消其他 control |
+| 自动取参 | 参数未准备时的「取参」 | 用保存的登录态自动打开正文更新参数 |
+| 删除 | 行内删除 → 确认「删除账户」 | 删除登录凭据，历史保留；要恢复使用需重新扫码 |
+
+停止请求和停用会在下一次控制检查时生效；取消整个 GitHub 作业可能只能保留最后已写入的进度。正常每 10 次读取保存一次进度，默认约 5 分钟；Cookie 更新和结束结果另行保存。因此页面不是每 30 秒增加一次数字。
+
+手动运行会执行完整的账户目标，**不会只补差额**。自动运行关闭时也允许手动运行。不要因页面尚未刷新而反复点击运行。
+
+### 5.3 键盘和手机
+
+导航「总览 / 账户 / 记录」定位对应区域。「计划与通知」或手机上的设置入口打开同一配置窗口。Tab/Shift+Tab 切换控件，Enter 提交表单，Esc 关闭弹窗；扫码窗口的 Esc 会取消本次绑定。页面在 320px 起适配，账户行转为卡片，不需要横向拖动表格。
+
+## 6. 自动计划和手动读取参数
+
+打开「计划与通知」：
+
+| 设置 / 按钮 | 行为 |
+| --- | --- |
+| 开启自动运行 | 开启每日阅读和自动保活的总开关 |
+| 开启保活续期 | 总开关开启时，每 6 小时续期；取消勾选只关保活 |
+| 保存计划 | 等待加密指令回执后生效，不是仅修改当前页面 |
+| 保活一次 | 立即手动续期，不阅读；绕过自动开关 |
+| 读取参数 → 每次间隔 | 0 使用默认 30 秒；正数 1～30 秒，仅影响从此页面手动发起的阅读 |
+| 读取参数 → 单账户截止 | 0 根据目标与网络余量计算；正数最长 7200 秒，提前到时会留下未完成结果 |
+| 按参数运行 | 按当前输入手动运行全部可运行账户；不会保存成每日计划 |
+
+每天阅读是北京时间 01:07；保活是北京时间 02:00 / 08:00 / 14:00 / 20:00。页面只提供开关，修改时间需要维护者修改工作流 cron 并同步文档。
+
+平时保持两个参数为 0。缩短间隔用于维护验证，不能把测试耗时当成实际经过 20 分钟的证据。关闭设置窗口后参数仍在本次页面，重载恢复默认。
+
+阅读与保活使用同一个 GitHub 并发组，避免两者一起修改会话；保活可能等待阅读结束。账户多时阅读会自动分成每片最多 5 个账户的作业，最多 3 片同时运行，最后统一汇总飞书。
+
+## 7. 飞书每日摘要与其他通知
+
+### 7.1 配置飞书（推荐的日常渠道）
+
+1. 在飞书中准备接收消息的群。群设置 → 群机器人 → 添加机器人 → 自定义机器人，获取完整 Webhook。
+2. 如果机器人启用了签名校验，另外保存它的签名密钥。
+3. 控制台 →「计划与通知」，勾选「飞书」，展开「飞书配置」。
+4. 将 Webhook 填入「机器人 Webhook」；启用了签名才填「签名密钥」。
+5. 点击「保存通知」，等提示已保存。保存后口令输入会清空，这是正常行为。
+6. 「测试推送渠道」选「飞书」，点击「测试推送」。成功应同时满足页面确认、control 作业成功、飞书群收到测试消息。
+7. 手动运行一次账户。整批结束后应收到「今日阅读 X/Y 账户完成」的摘要，包括每个账户本次/目标分钟以及完成、未完成、需扫码等状态。
+
+飞书成功阅读也发送，失败也在本批摘要中说明。其他渠道保持异常提醒。整批多个分片结束后只做一次汇总；如果你重跑整个工作流，会产生新一轮结果和新一条摘要。
+
+已有 FEISHU_WEBHOOK Secret、且尚未保存通知设置时，运行结束会把它迁入加密设置并启用飞书。已保存的通知选择不会被 Secret 自动覆盖；若之前只选了邮件或关闭通知，按上面的步骤勾选飞书。
+
+机器人设置注意：
+
+- 关键词校验可使用 wxread，消息标题包含它。
+- 签名密钥必须和机器人配置一致。需要更换时填新值再保存。
+- GitHub 普通云端 runner 出口 IP 会变化；配置了固定 IP 白名单可能拒绝请求，需使用适合云端的机器人校验方式。
+- 页面字段留空会沿用保存值，不能用留空来删除旧签名密钥。若机器人签名开关改变，按维护手册的「清除旧通知字段」处理。
+- 取消勾选飞书再保存会停止每日飞书摘要，不删除已保存的 Webhook。
+
+### 7.2 其他三个渠道
+
+也在同一窗口配置。选中渠道、填字段、保存后再测试。
+
+| 渠道 | 必填配置 | 测试方式 / 提醒范围 |
+| --- | --- | --- |
+| 邮件 | SMTP 服务器、发件邮箱、授权码/密码；端口默认 465；收件邮箱留空发给自己，多个用逗号分隔 | 「测试邮件」；日常用于异常通知 |
+| PushPlus | PushPlus token | 测试渠道选 PushPlus → 测试推送；日常用于异常通知 |
+| Telegram | Bot token、Chat ID | 测试渠道选 Telegram → 测试推送；日常用于异常通知 |
+
+邮件 465 使用 SMTP SSL，587 使用 STARTTLS。QQ 邮箱通常填 smtp.qq.com、465 和邮箱授权码。Telegram 的 Chat ID 必须对应机器人有发言权限的会话。
+
+未改的口令留空保留原值，不会从页面重新显示。非口令字段会显示已保存内容。勾选渠道但不保存，测试仍使用旧的云端配置。全部取消勾选并保存可关闭通知，阅读仍然继续。
+
+## 8. 不靠问人的报错处理
+
+先看页面具体提示，再打开 Actions 中同时间的 control/read/warm 作业。日志最后的原因码比单纯红绿更有用，不要公开完整配置或凭据。
+
+| 现象 | 检查和处理 | 恢复标准 |
+| --- | --- | --- |
+| 连接 401 / 403 | token 过期、仓库权限或组织审批；重新生成有 Contents/Actions 读写权限的 token 并连接 | 页面载入账户 |
+| 连接 404 | owner/repo、状态分支名称、token 的仓库范围；首次需先跑 control init | 头部显示正确仓库 |
+| 解密失败 | 页面状态密钥与 WXREAD_STATE_KEY 不一致；使用原密钥，不要生成新值覆盖 | 账户/设置/记录能读取 |
+| 操作已提交，迟迟没有结果 | control 是否排队、安装失败、运行在旧提交；页面最多等待 15 分钟 | 正确 session 的作业完成，回执可确认 |
+| 取参失败 / payload_invalid / no_synckey | 确认书架与正文可读，点「取参」；还不行则重绑 | 参数齐全并真实读取成功 |
+| 需重新绑定 / renew_failed | 明确登录失效，用同一微信号扫码；单次网络失败不等于需扫码 | 状态正常，可运行 |
+| 偶发网络错误 | 程序有退避和一次有界恢复；临时失败仍可下次重试 | 下一次 read/warm 成功 |
+| 今日一直为 0 | 自动总开关、账户启用、登录/参数状态；Actions 是否真的执行 read；查看 reason | 新读取记录出现 |
+| state_error / 退出码 4 | contents 写权限、状态分支保护或持续冲突；修正权限后重跑一次 | 进度与记录写回，不再报 4 |
+| deadline / 未完成 | 手动截止过短；改回 0；不要把 1200 秒固定截止用于 40 次正常阅读 | 本次/目标达标 |
+| 页面数字长时间不变 | 默认约 5 分钟进度落盘；点刷新；连接中断时检查 token 和网络 | 上次同步更新，有新进度 |
+| 飞书不提醒 | 勾选飞书并保存、通知总开关、report 是否执行；测试推送检查关键词/签名/Webhook | 测试消息和读后摘要均送达 |
+| 飞书失败但阅读成功 | report 失败不会删除阅读结果；修正机器人配置再测试，不必为了通知重复整批阅读 | 测试成功；后续日常摘要正常 |
+| 每天没有 Actions 运行 | 工作流启用状态、默认分支 main、cron、GitHub 额度/计费/服务情况；被停用则 Enable workflow | 下次出现 schedule 运行 |
+| 更新后仍是旧页面 | 等 pages 成功、强制刷新；确认页面地址与 pages 部署提交；旧 run 不会使用新代码 | 新版布局载入 |
+| 二维码上有方块或浮层 | 取消旧作业，使用新版重新发起；若站点变更二维码载体，维护者更新 qr.py 选择器 | 新二维码可扫 |
+
+「全部失败」会让阅读作业失败；部分账户成功可能保持绿色，飞书和页面说明哪一个失败。取消或提前截止保留部分进度，不能据绿色或一个数字推断全体完成。
+
+如果需要临时停用，关闭「开启自动运行」并保存，再用「全部停止」结束已启动的阅读。不要用改坏状态密钥来停机。
+
+## 9. 首次上线验收清单
+
+按顺序做一遍，之后无需每天手动操作：
+
+1. pages 成功，根地址与 /web/ 都能打开。
+2. 控制台连接，账户和设置正常解密。
+3. 微信真实扫码并手机确认；自动取参完成，页面无需 cURL。
+4. 账户目标设为你希望的分钟数，启用参与阅读。
+5. 保存飞书配置，测试消息在群里收到。
+6. 参数保持 0，运行一个账户；等完整目标完成。
+7. 查看微信读书自身记录、页面本次/目标、Actions read 和 report 结果、飞书汇总。
+8. 保活一次，续期时间更新。
+9. 两个自动开关开启并保存，关闭浏览器/本机。
+10. 下一个计划批次完成后，飞书摘要、当天记录和自动 schedule 运行相符。
+
+修复期间真实验证与替身验证的具体范围见 [reviews/G2-repair.md](reviews/G2-repair.md)。真实扫码/本机阅读、GitHub 云端状态写入、飞书接口接受、用户实际收到消息是不同的验证项，应分别记录。
+
+## 10. 升级、备份和回滚
+
+已有这个项目时：
+
+1. 先读 [MAINTENANCE.md](MAINTENANCE.md) 的升级流程，保存状态分支和原密钥备份。
+2. 合并经过检查的更新 PR 到 main；不要把 wxread-state 合并进 main，不要重置密钥，不要清空账户。
+3. 等 tests 和 pages 成功，强制刷新控制台。
+4. 检查账户、目标、开关和通知仍在；保活一次和飞书测试，必要时进行一次正常阅读。
+5. 确认下一次每日运行后结束升级。
+
+升级只替换程序代码，状态继续保存在独立分支。回滚代码用 GitHub PR 的 Revert 或 git revert。回滚状态是独立操作，可能丢失回滚点之后的 Cookie、设置和历史，操作前关闭自动任务并读维护手册。
+
+给大肥鱼或其他维护者的固定交接入口是根目录 [AGENTS.md](../AGENTS.md)、[MAINTENANCE.md](MAINTENANCE.md)、[ARCHITECTURE.md](ARCHITECTURE.md) 和 [DESIGN.md](DESIGN.md)。你只需给出要改的功能和这几个文档，不需要重新解释密钥、计划和页面约定。
