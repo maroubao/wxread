@@ -12,7 +12,7 @@ from test_reader import FakeTransport, TransportError, err, ok, renew_ok
 def run_with_notifications(store, monkeypatch, script):
     account = account_from_curl(CURL_SAMPLE, label="主号")
     store.save_account(account)
-    store.save_settings({"notifications": {"enabled": True, "channels": ["feishu"], "feishu": {}}})
+    store.save_settings({"notifications": {"enabled": True, "channels": ["email"], "email": {}}})
     messages = []
     monkeypatch.setattr(notify, "send", lambda channel, cfg, title, text: messages.append((title, text)) or notify.NotifyResult(channel, True))
     worker.cmd_read(store, env_base(), transport_factory=lambda: FakeTransport(script), sleep=lambda _s: None)

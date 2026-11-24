@@ -10,7 +10,7 @@ from uuid import uuid4
 
 from .accounts import STATUS_OK, Account
 from .logsafe import scrub
-from .reader import DEFAULT_DEADLINE, DEFAULT_PACE, Outcome, Reader
+from .reader import DEFAULT_PACE, Outcome, Reader
 from .state import StateError, StateStore, utcnow_iso
 
 log = logging.getLogger("wxread.jobs")
@@ -36,8 +36,9 @@ class JobRunner:
         clock: Callable[[], float] = time.time,
         sleep: Callable[[float], None] = time.sleep,
         pace: float = DEFAULT_PACE,
-        deadline: float = DEFAULT_DEADLINE,
+        deadline: float | None = None,
         on_event: Callable[[JobEvent], None] | None = None,
+        batch_id: str = "",
     ) -> None:
         self.store = store
         self.transport_factory = transport_factory
@@ -46,6 +47,7 @@ class JobRunner:
         self.pace = pace
         self.deadline = deadline
         self.on_event = on_event
+        self.batch_id = batch_id
         self._cancelled = False
         self._baselines: dict[str, dict | None] = {}
         self._superseded: set[str] = set()
@@ -66,7 +68,7 @@ class JobRunner:
             return False
         if current is None:
             return self._baselines.get(account.id) is not None
-        return current.get("enabled") is False or current.get("status") != STATUS_OK
+        return current.get("enabled") is False or current.get("status") != STATUS_OK or bool((current.get("progress") or {}).get("cancel_requested"))
 
     def _sleep(self, seconds: float) -> None:
         if self.sleep is not time.sleep:
@@ -96,6 +98,8 @@ class JobRunner:
         account.extra["progress"] = {
             "run_id": run_id, "status": "running", "read_count": 0,
             "target_count": account.target_count, "started_at": started_at, "updated_at": started_at,
+            "cancel_requested": False,
+            "batch_id": self.batch_id,
         }
         try:
             self._baselines[account.id] = self.store.load_account(account.id)
@@ -130,6 +134,8 @@ class JobRunner:
             finished_at = utcnow_iso()
             record = outcome.as_run(account.id, started_at, finished_at)
             record.update({"run_id": run_id, "label": account.label})
+            if self.batch_id:
+                record["batch_id"] = self.batch_id
             account.extra["progress"].update({
                 "status": "cancelled" if outcome.reason == "cancelled" else "completed",
                 "read_count": outcome.read_count, "updated_at": finished_at,

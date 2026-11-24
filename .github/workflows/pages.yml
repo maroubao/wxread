@@ -6,6 +6,7 @@ on:
     branches: [main]
     paths:
       - "web/**"
+      - "index.html"
       - "docs/design/**"
       - ".github/workflows/pages.yml"
   workflow_dispatch:
@@ -27,7 +28,7 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: 确认静态资源齐全
         run: |

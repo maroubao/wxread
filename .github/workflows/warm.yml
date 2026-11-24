@@ -1,10 +1,16 @@
 name: warm
+run-name: "warm ${{ inputs.request_id || github.run_id }}"
 
 # 每 6 小时续期一次（UTC 00/06/12/18 = 北京 08/14/20/02），让会话保持活跃。
 on:
   schedule:
     - cron: "0 */6 * * *"
   workflow_dispatch:
+    inputs:
+      request_id:
+        description: "页面跟踪id"
+        required: false
+        type: string
 
 concurrency:
   group: wxread-session
@@ -19,11 +25,11 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 1
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: pip
@@ -37,4 +43,6 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           WXREAD_STATE_KEY: ${{ secrets.WXREAD_STATE_KEY }}
+          WXREAD_STATE_BRANCH: ${{ vars.WXREAD_STATE_BRANCH || 'wxread-state' }}
+          FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
         run: python -m wxread.worker warm

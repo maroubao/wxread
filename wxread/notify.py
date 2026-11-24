@@ -9,7 +9,11 @@
 from __future__ import annotations
 
 import json
+import base64
+import hashlib
+import hmac
 import smtplib
+import time
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
@@ -56,6 +60,28 @@ def render_run_report(records: list[Mapping]) -> tuple[str, str]:
     return title, "\n".join(lines)
 
 
+def render_daily_report(records: list[Mapping], accounts: list[Mapping]) -> tuple[str, str]:
+    by_account = {str(record.get("account_id")): record for record in records}
+    enabled = [account for account in accounts if account.get("enabled", True)]
+    completed = 0
+    total_reads = sum(int(record.get("read_count") or 0) for record in records)
+    lines = []
+    for account in enabled:
+        record = by_account.get(str(account.get("id")), {})
+        count = int(record.get("read_count") or 0)
+        target = int(record.get("target_count") or account.get("target_count") or 40)
+        ok = bool(record) and count >= target and int(record.get("exit_code", 0)) == 0
+        completed += int(ok)
+        status = "完成" if ok else "需要重新扫码" if account.get("status") == "needs_login" else "未完成"
+        if record.get("reason") == "cancelled":
+            status = "已停止"
+        if record.get("state_error"):
+            status = "结果保存失败"
+        lines.append(f"{account.get('label') or account.get('id')}：{count / 2:g} / {target / 2:g} 分，{status}")
+    title = f"{DEFAULT_SUBJECT_PREFIX} 今日阅读 {completed}/{len(enabled)} 账户完成，{total_reads / 2:g} 分钟"
+    return scrub(title), scrub("\n".join(lines) or "没有可运行账户，打开控制台扫码绑定。")
+
+
 def render_failure(account_label: str, reason: str, hint: str = "") -> tuple[str, str]:
     title = f"{DEFAULT_SUBJECT_PREFIX} 需要重新扫码：{account_label}"
     text = f"账户：{account_label}\n原因：{reason}"
@@ -91,7 +117,7 @@ def _post(url: str, body: bytes, headers: Mapping[str, str]) -> str:
         with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT) as response:
             return response.read(8192).decode("utf-8", "replace")
     except Exception as exc:  # 网络/证书/超时统一收口
-        raise NotifyError(f"{type(exc).__name__}: {exc}") from exc
+        raise NotifyError(f"HTTP通知请求失败（{type(exc).__name__}）") from exc
 
 
 def send_email(cfg: Mapping, title: str, text: str) -> str:
@@ -136,12 +162,19 @@ def send_feishu(cfg: Mapping, title: str, text: str) -> str:
     webhook = (cfg.get("webhook") or "").strip()
     if not webhook:
         raise NotifyError("飞书缺少 webhook")
-    body = json.dumps(
-        {"msg_type": "text", "content": {"text": f"{scrub(title)}\n{scrub(text)}"}},
-        ensure_ascii=False,
-    ).encode("utf-8")
+    payload = {"msg_type": "text", "content": {"text": f"{scrub(title)}\n{scrub(text)}"}}
+    secret = str(cfg.get("secret") or "")
+    if secret:
+        timestamp = str(int(time.time()))
+        signing_key = f"{timestamp}\n{secret}".encode("utf-8")
+        payload.update({"timestamp": timestamp, "sign": base64.b64encode(hmac.new(signing_key, b"", hashlib.sha256).digest()).decode()})
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     raw = _post(webhook, body, {"Content-Type": "application/json"})
-    return "" if '"code":0' in raw.replace(" ", "") else raw[:200]
+    try:
+        response = json.loads(raw)
+    except ValueError:
+        raise NotifyError("飞书响应不是JSON")
+    return "" if response.get("code", response.get("StatusCode")) == 0 else str(response.get("msg") or response.get("StatusMessage") or "飞书接口返回失败")[:200]
 
 
 def send_telegram(cfg: Mapping, title: str, text: str) -> str:

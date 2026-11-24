@@ -32,6 +32,12 @@ DEFAULT_DEADLINE = 20 * 60
 MAX_BODY_BYTES = 64 * 1024
 BACKOFF = (5, 15, 45)
 
+
+def reading_deadline(account: Account, pace: float = DEFAULT_PACE, override: float | None = None) -> float:
+    if override is not None and override > 0:
+        return override
+    return max(DEFAULT_DEADLINE, account.target_count * (pace + DEFAULT_TIMEOUT) + 120)
+
 LEVELS = ("L0", "L1", "L2", "L3")
 SESSION_ERRCODES = (-2012, -2013)
 COOKIE_VARIANTS = (
@@ -208,7 +214,7 @@ class Reader:
         transport: Transport | None = None,
         *,
         pace: float = DEFAULT_PACE,
-        deadline: float = DEFAULT_DEADLINE,
+        deadline: float | None = None,
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.time,
         rand: random.Random | None = None,
@@ -219,7 +225,7 @@ class Reader:
         self.account = account
         self.transport = transport or RequestsTransport()
         self.pace = max(0.0, float(pace))
-        self.deadline = float(deadline)
+        self.deadline = reading_deadline(account, self.pace, deadline)
         self.sleep = sleep
         self.clock = clock
         self.rand = rand or random.Random()

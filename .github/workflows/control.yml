@@ -1,4 +1,5 @@
 name: control
+run-name: "control ${{ inputs.session_id || github.run_id }}"
 
 # 所有管理动作都走这一个入口：从网页端（gh 变量/网页 form 或 web/ 页面）提交密文指令。
 # 明文口令与 cookie 只在浏览器里加密，仓库/日志里只有密文。
@@ -43,11 +44,11 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 1
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: pip
@@ -63,7 +64,7 @@ jobs:
       - name: 安装浏览器（qr 指令才需要）
         if: ${{ github.event.inputs.control == 'instruction' }}
         run: |
-          pip install "playwright>=1.45,<2"
+          pip install -r requirements-browser.txt
           if [ -x /opt/google/chrome/chrome ] || command -v google-chrome >/dev/null 2>&1; then
             google-chrome --version || /opt/google/chrome/chrome --version || true
             echo "使用 runner 预装的 Chrome，跳过浏览器下载"
@@ -76,6 +77,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           WXREAD_STATE_KEY: ${{ secrets.WXREAD_STATE_KEY }}
+          WXREAD_STATE_BRANCH: ${{ vars.WXREAD_STATE_BRANCH || 'wxread-state' }}
           WXREAD_CONTROL: ${{ github.event.inputs.control }}
           WXREAD_INSTRUCTION: ${{ github.event.inputs.instruction }}
           WXREAD_CONTROL_SK: ${{ secrets.WXREAD_CONTROL_SK }}

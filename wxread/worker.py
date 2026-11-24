@@ -25,17 +25,19 @@ import argparse
 import base64
 import json
 import logging
+import math
 import os
 import signal
 import sys
 import threading
+from datetime import datetime, timezone
 from typing import Mapping
 
 from .crypto import CryptoFailure, b64d
 from .accounts import Account, AccountError, MissingFieldsError, clamp_target_count, from_legacy
 from .jobs import JobEvent, JobRunner
 from .logsafe import scrub
-from .reader import DEFAULT_DEADLINE, DEFAULT_PACE
+from .reader import DEFAULT_PACE, reading_deadline
 from .state import DEFAULT_BRANCH, GitHubContents, StateError, StateStore, utcnow_iso
 
 log = logging.getLogger("wxread.worker")
@@ -202,6 +204,95 @@ def schedule_gate(store: StateStore, mode: str, *, automatic: bool = True) -> st
     return ""
 
 
+def notification_settings(store: StateStore, env: Mapping[str, str]) -> dict:
+    settings = store.load_settings()
+    webhook = _env(env, "FEISHU_WEBHOOK") or _env(env, "WXREAD_FEISHU_WEBHOOK")
+    block = settings.get("notifications")
+    if webhook and (block is None or ("feishu" in block.get("channels", []) and not (block.get("feishu") or {}).get("webhook"))):
+        def migrate(current: dict) -> dict:
+            notifications = dict(current.get("notifications") or {"enabled": True, "channels": ["feishu"]})
+            feishu = dict(notifications.get("feishu") or {})
+            feishu.setdefault("webhook", webhook)
+            notifications["feishu"] = feishu
+            current["notifications"] = notifications
+            return current
+        settings = store.mutate_settings(migrate)
+        log.info("deprecated: FEISHU_WEBHOOK已迁入加密通知配置")
+    return settings
+
+
+def read_options(env: Mapping[str, str]) -> tuple[float, float | None]:
+    try:
+        pace = float(_env(env, "WXREAD_PACE", str(DEFAULT_PACE)))
+        deadline = float(_env(env, "WXREAD_DEADLINE", "0"))
+    except (ValueError, TypeError) as exc:
+        raise ConfigError("读取参数必须是数字") from exc
+    if not math.isfinite(pace) or not 0 <= pace <= 30:
+        raise ConfigError("读取间隔必须在0到30秒之间")
+    if not math.isfinite(deadline) or not 0 <= deadline <= 19800:
+        raise ConfigError("读取截止时间必须在0到19800秒之间")
+    return pace, deadline or None
+
+
+def read_matrix(accounts: list[Account], pace: float, deadline: float | None) -> dict:
+    groups = []
+    ids: list[str] = []
+    seconds = 0.0
+    for account in accounts:
+        if not account.enabled or account.status != "ok":
+            continue
+        budget = reading_deadline(account, pace, deadline)
+        if ids and (len(ids) >= 5 or seconds + budget > 330 * 60):
+            groups.append({"account_ids": ",".join(ids), "timeout_minutes": math.ceil(seconds / 60) + 3})
+            ids, seconds = [], 0.0
+        ids.append(account.id)
+        seconds += budget
+    if ids:
+        groups.append({"account_ids": ",".join(ids), "timeout_minutes": math.ceil(seconds / 60) + 3})
+    return {"include": groups}
+
+
+def cmd_plan(store: StateStore, env: Mapping[str, str]) -> int:
+    allowed = not schedule_gate(store, "read", automatic=env.get("GITHUB_EVENT_NAME") != "workflow_dispatch")
+    accounts = load_accounts(store, env) if allowed else []
+    apply_env_overrides(accounts, env)
+    selected = [item.strip() for item in (_env(env, "WXREAD_ACCOUNT_IDS") or "").split(",") if item.strip()]
+    if selected:
+        accounts = [account for account in accounts if account.id in selected]
+    pace, deadline = read_options(env)
+    matrix = read_matrix(accounts, pace, deadline)
+    text = json.dumps(matrix, separators=(",", ":"))
+    if env.get("GITHUB_OUTPUT"):
+        with open(env["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+            output.write(f"matrix={text}\ncount={len(matrix['include'])}\nallowed={str(allowed).lower()}\n")
+    print(text, flush=True)
+    return EXIT_OK
+
+
+def cmd_report(store: StateStore, env: Mapping[str, str]) -> int:
+    from . import notify
+    batch_id = str(_env(env, "WXREAD_BATCH_ID") or _env(env, "GITHUB_RUN_ID") or "")
+    accounts = load_accounts(store, env)
+    selected = [item.strip() for item in (_env(env, "WXREAD_ACCOUNT_IDS") or "").split(",") if item.strip()]
+    if selected:
+        accounts = [account for account in accounts if account.id in selected]
+    records = [record for record in store.recent_runs(limit=200) if record.get("batch_id") == batch_id]
+    known = {record.get("run_id") for record in records}
+    for account in accounts:
+        progress = account.extra.get("progress") or {}
+        if progress.get("batch_id") == batch_id and progress.get("run_id") not in known:
+            records.append({**progress, "account_id": account.id, "label": account.label, "level": "L2", "reason": "workflow_interrupted", "exit_code": 2})
+    title, message = notify.render_daily_report(records, [account.to_dict() for account in accounts])
+    settings = notification_settings(store, env)
+    if "feishu" not in (settings.get("notifications") or {}).get("channels", []):
+        return EXIT_OK
+    deliveries = notify.dispatch(settings, title, message, channels=["feishu"])
+    for delivery in deliveries:
+        if not delivery.ok:
+            log.warning("飞书摘要发送失败：%s", scrub(delivery.detail))
+    return EXIT_OK if all(delivery.ok for delivery in deliveries) else EXIT_ALL_FAILED
+
+
 def cmd_read(store: StateStore, env: Mapping[str, str], transport_factory=None, sleep=None) -> int:
     blocked = schedule_gate(store, "read", automatic=env.get("GITHUB_EVENT_NAME") != "workflow_dispatch")
     if blocked:
@@ -210,17 +301,20 @@ def cmd_read(store: StateStore, env: Mapping[str, str], transport_factory=None, 
         return EXIT_OK
     accounts = load_accounts(store, env)
     apply_env_overrides(accounts, env)
+    selected = [item.strip() for item in (_env(env, "WXREAD_ACCOUNT_IDS") or "").split(",") if item.strip()]
+    if selected:
+        accounts = [account for account in accounts if account.id in selected]
     if not accounts:
         log.error("没有任何账户：先扫码绑定或导入 curl")
         return EXIT_CONFIG
-    pace = float(_env(env, "WXREAD_PACE", str(DEFAULT_PACE)) or DEFAULT_PACE)
-    deadline = float(_env(env, "WXREAD_DEADLINE", str(DEFAULT_DEADLINE)) or DEFAULT_DEADLINE)
+    pace, deadline = read_options(env)
     runner = JobRunner(
         store,
         transport_factory=transport_factory,
         pace=pace,
         deadline=deadline,
         on_event=_print_event,
+        batch_id=str(_env(env, "WXREAD_BATCH_ID") or _env(env, "GITHUB_RUN_ID") or ""),
         **({"sleep": sleep} if sleep is not None else {}),
     )
     started = utcnow_iso()
@@ -239,13 +333,22 @@ def cmd_read(store: StateStore, env: Mapping[str, str], transport_factory=None, 
     log.info("本次共读 %s 次，账户 %s 个，失败 %s 个", total, len(records), len(failed))
     print(f"::notice::session done reads={total} accounts={len(records)} failed={len(failed)} since={started}", flush=True)
     alerts = [record for record in records if record.get("level") in {"L2", "L3"} and record.get("reason") != "cancelled"]
-    if alerts:
+    if records or alerts:
         from . import notify
         try:
-            settings = store.load_settings()
+            settings = notification_settings(store, env)
+            channels = list((settings.get("notifications") or {}).get("channels") or [])
+            if "feishu" in channels and _env(env, "WXREAD_REPORT_MODE") != "defer":
+                title, message = notify.render_daily_report(records, [account.to_dict() for account in accounts])
+                for delivery in notify.dispatch(settings, title, message, channels=["feishu"]):
+                    if not delivery.ok:
+                        log.warning("飞书摘要发送失败：%s", scrub(delivery.detail))
+            alert_channels = [channel for channel in channels if channel != "feishu"]
             for record in alerts:
+                if not alert_channels:
+                    continue
                 title, message = notify.render_read_alert(record)
-                for delivery in notify.dispatch(settings, title, message):
+                for delivery in notify.dispatch(settings, title, message, channels=alert_channels):
                     if not delivery.ok:
                         log.warning("通知 %s 发送失败：%s", delivery.channel, scrub(delivery.detail))
         except StateError as exc:
@@ -286,7 +389,7 @@ def cmd_warm(store: StateStore, env: Mapping[str, str], transport_factory=None, 
     pending = [result for result in summary.results if result.notify]
     if pending:
         from . import notify
-        settings = store.load_settings()
+        settings = notification_settings(store, env)
         for result in pending:
             title, message = notify.render_failure(result.label or result.account_id, result.note, "重新扫码后会恢复每日阅读")
             deliveries = notify.dispatch(settings, title, message)
@@ -313,11 +416,22 @@ def purge_stale_qr(store: StateStore, keep_session: str) -> int:
     except (StateError, NotImplementedError):
         return 0
     removed = 0
+    protected: dict[str, bool] = {}
     for name in names:
         base = name.rsplit("/", 1)[-1]
         if not (base.startswith("qr-") and base.endswith(".png")):
             continue
         if base.startswith(f"qr-{keep_session}-"):
+            continue
+        session = base.rsplit("-", 2)[0][3:]
+        if session not in protected:
+            try:
+                claim = store.read_encrypted(store.session_path(session))
+                claimed = datetime.fromisoformat(claim["claimed_at"].replace("Z", "+00:00")) if claim else None
+                protected[session] = bool(claimed and (datetime.now(timezone.utc) - claimed).total_seconds() < 1800)
+            except (StateError, ValueError, TypeError, KeyError):
+                protected[session] = True
+        if protected[session]:
             continue
         try:
             store.backend.delete(f"responses/{base}", f"chore(state): drop stale qr {base}")
@@ -420,7 +534,7 @@ def cmd_control(store: StateStore, env: Mapping[str, str], *, qr_page_factory=No
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="wxread.worker")
-    parser.add_argument("command", choices=("read", "warm", "migrate", "control"))
+    parser.add_argument("command", choices=("read", "warm", "migrate", "control", "plan", "report"))
     parser.add_argument("--verbose", action="store_true")
     return parser
 
@@ -442,6 +556,10 @@ def main(argv: list[str] | None = None, env: Mapping[str, str] | None = None) ->
             return cmd_migrate(store, env)
         if args.command == "read":
             return cmd_read(store, env)
+        if args.command == "plan":
+            return cmd_plan(store, env)
+        if args.command == "report":
+            return cmd_report(store, env)
         if args.command == "control":
             return cmd_control(store, env)
         return cmd_warm(store, env)
