@@ -1,6 +1,7 @@
 """自动抓取阅读参数：`web/book/read` 的 POST body → 账户 read_payload。"""
 
 import json
+import pytest
 
 from wxread import capture, control
 from wxread.state import StateStore
@@ -182,6 +183,25 @@ def test_qr_saves_cookie_rotated_during_payload_capture(store: StateStore):
 
     receipt = control.handle_qr(make_ctx(store, RotatingPage()), {})
     assert store.load_account(receipt["account_id"])["cookies"]["wr_skey"] == "rotated-after-login"
+
+
+def test_saved_cookie_capture_preserves_a_concurrent_new_login(store: StateStore):
+    from wxread.accounts import account_from_curl
+    from support import CURL_SAMPLE
+
+    account = account_from_curl(CURL_SAMPLE)
+    store.save_account(account)
+
+    class ReboundWhileCapturing(CapturingPage):
+        def capture_read_payload(self):
+            fresh = store.load_account(account.id)
+            fresh["cookies"]["wr_skey"] = "new-login-wins"
+            store.save_account(fresh)
+            return super().capture_read_payload()
+
+    with pytest.raises(control.ControlError, match="登录态已更新"):
+        control.handle_capture(make_ctx(store, ReboundWhileCapturing()), {"account_id": account.id})
+    assert store.load_account(account.id)["cookies"]["wr_skey"] == "new-login-wins"
 
 
 def test_incomplete_qr_account_can_be_renamed_and_disabled(store: StateStore):

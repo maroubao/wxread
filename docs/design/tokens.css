@@ -42,6 +42,7 @@
   --mono: "SF Mono", "JetBrains Mono", ui-monospace, monospace;
 
   --fs-display: 28px;
+  --fs-display-mobile: 24px;
   --fs-metric: 30px;
   --fs-h2: 15px;
   --fs-body: 13px;
@@ -63,6 +64,7 @@
   --r-md: 10px;
   --r-lg: 14px;
   --r-full: 999px;
+  --r-chart: 4px;
 
   /* ---- 阴影 ---- */
   --shadow-1: 0 1px 2px rgba(16, 24, 40, 0.04);
@@ -71,6 +73,7 @@
   /* ---- 版式 ---- */
   --content-max: 1180px;
   --rail-w: 320px;
+  --chart-height: 144px;
   --dur: 160ms;
 }
 

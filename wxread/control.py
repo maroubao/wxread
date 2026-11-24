@@ -28,6 +28,7 @@ ACTIONS = (
     "init",
     "qr",
     "capture",
+    "stop",
     "import",
     "update",
     "delete",
@@ -256,6 +257,8 @@ def handle_capture(ctx: ControlContext, payload: Mapping[str, Any]) -> dict:
         def merge(current: dict | None) -> dict:
             if current is None:
                 raise ControlError("账户已删除")
+            if current.get("cookies") != existing.get("cookies") or current.get("read_payload") != existing.get("read_payload"):
+                raise ControlError("账户登录态已更新，刷新后重新自动取参")
             merged = _merge_accounts(current, account)
             merged.note = ""
             merged.last_ok_at = account.last_ok_at
@@ -352,6 +355,24 @@ def handle_delete(ctx: ControlContext, payload: Mapping[str, Any]) -> dict:
     return {"ok": True, "account_id": account_id, "deleted": True}
 
 
+def handle_stop(ctx: ControlContext, payload: Mapping[str, Any]) -> dict:
+    account_id = str(payload.get("account_id") or "")
+    run_id = str(payload.get("run_id") or "")
+
+    def stop(current: dict | None) -> dict:
+        if current is None:
+            raise ControlError("账户不存在")
+        progress = dict(current.get("progress") or {})
+        if not run_id or progress.get("run_id") != run_id or progress.get("status") != "running":
+            raise ControlError("当前运行已更新，刷新后重试")
+        progress["cancel_requested"] = True
+        current["progress"] = progress
+        return current
+
+    ctx.store.mutate_account(account_id, stop, "control: stop account run")
+    return {"ok": True, "account_id": account_id, "run_id": run_id}
+
+
 def handle_schedule(ctx: ControlContext, payload: Mapping[str, Any]) -> dict:
     def update(settings: dict) -> dict:
         schedule = dict(settings.get("schedule") or {})
@@ -424,6 +445,7 @@ _HANDLERS: dict[str, Callable[[ControlContext, Mapping[str, Any]], dict]] = {
     "init": handle_init,
     "qr": handle_qr,
     "capture": handle_capture,
+    "stop": handle_stop,
     "import": handle_import,
     "update": handle_update,
     "delete": handle_delete,
