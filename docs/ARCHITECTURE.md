@@ -1,306 +1,132 @@
-# ARCHITECTURE — wxread v4 架构与数据流
-
-> 状态：G1 待审核 · 2026-11-23 · 对应 PLAN v4 与 DESIGN v1.0（A 钢蓝 #2563EB）
-> 本文只描述**结构与契约**，不含实现代码。凡本文写死的字段名、状态值、退出码，实现期不得改名。
-> 视觉与组件规范见 [DESIGN.md](DESIGN.md)，安全与信任边界见 [THREAT-MODEL.md](THREAT-MODEL.md)。
-
----
-
-## 0. 一句话
-
-把"单账号 + 人工重抓 curl + 过期靠人发现"的脚本，换成"多账号 + 网页扫码绑定 + 续期结果持久化 + 每日自动跑 + 只有真被踢下线才提醒"的 GitHub 原生控制台。运行环境仍然只有 GitHub：Actions 干活，Pages 出界面，`wxread-state` 分支存密文状态。
-
-**非目标**：多租户 SaaS、对外开放注册、手机 App、把 Cookie 存到第三方云、本地/Docker 部署。
-
----
-
-## 1. 现状（v3）代码地图
-
-仓库：`maroubao/wxread`，分支 `main`，审计基线 `7341b53`（2026-05-09）。
-
-```
-main.py          260 行   请求拼接、加密签名、阅读循环、失败分类
-config.py        146 行   READ_NUM / curl 解析 / cookies / headers / data / book / chapter
-push.py          190 行   PushPlus / Telegram / WxPusher / ServerChan / 飞书
-log_utils.py      35 行   带进度行的 logging 封装
-Dockerfile        28 行   本地 cron 容器（本期决策删除）
-.github/workflows/deploy.yml  67 行  唯一工作流
-```
-
-### 1.1 运行期数据流
-
-```
-Secrets(WXREAD_CURL_BASH) ──▶ config.py:30
-                                │ convert() config.py:106-138
-                                ▼
-                     headers / cookies / data（模块级全局，可被 config.py:141-146 覆盖）
-                                │
-main.py:250-260 ──▶ run() main.py:199-247
-                      │
-                      ├─ refresh_cookie() main.py:116-126
-                      │    └─ get_wr_skey() main.py:96-106 → POST /web/login/renewal
-                      │         └─ 返回 wr_skey 前 8 位，写回 cookies["wr_skey"] main.py:120
-                      │
-                      └─ while index <= READ_NUM:
-                           build_read_payload() main.py:129-144
-                             ├─ b = random.choice(book)      main.py:132
-                             ├─ c = random.choice(chapter)   main.py:133
-                             ├─ ts/rn/sg/s 重算            main.py:135-143
-                           read_once() main.py:147-152 → POST /web/book/read
-                             └─ succ? → 有 synckey 则 index+1、sleep 30
-                                 └─ 无 synckey → fix_no_synckey() main.py:109-113
-                             └─ 非 succ → 疑似参数失效则 ReadPayloadError，否则 refresh_cookie()
-                                        main.py:235-244
-```
-
-### 1.2 状态生命周期（问题的机械原因）
-
-| 事实 | 位置 | 后果 |
-|---|---|---|
-| `cookies` 是模块级 dict，续期只改内存 | `config.py:33-41`、`main.py:120` | 进程结束即丢，下一次从 Secrets 里那份旧 curl 重新起步 |
-| `post_json()` 只 `return response` | `main.py:84-93` | 服务端 `Set-Cookie` 轮换被整份丢弃 |
-| `refresh_cookie()` 只取 `wr_skey` | `main.py:96-106` | `wr_vid` 等其余轮换 cookie 永不更新 |
-| 请求体模板写死 `appId/ps/pc/ci/co/sm/pr` | `config.py:69-85` | 抓包过久后报参数失效，只能重抓 |
-| 书籍与章节各自独立随机 | `main.py:132-133` | 章节不属于该书，服务端可能不计时长 |
-| 修复接口写死一本书 | `main.py:111`（`bookIds:["3300060341"]`） | 非三体账户修复无效 |
-| 失败重试无计数、无 sleep、`index` 不增 | `main.py:212-220` | 抖动时可能空转烧满额度 |
-| 推送分支 5 个渠道全在 | `push.py:164-190` | 与 §9 决策（只留 4 个）冲突，需在 P6 收口 |
-
-结论沿用 PLAN §1.2：**"过期"不是 cookie 活得短，而是刷新结果被扔掉**。v4 的核心是把"刷新 → 合并 → 持久化 → 保鲜"做成闭环。
-
----
-
-## 2. 目标架构（v4）
-
-```
-┌──────────────────────────── 浏览器（GitHub Pages，零构建） ────────────────────────────┐
-│  web/index.html + assets/*.js|css   ← 只有 <template> + 原生 Web Components            │
-│  1. 填 owner/repo + fine-grained PAT                                                   │
-│  2. 生成临时 X25519 密钥对，用仓库公钥 seal 指令                                        │
-│  3. 轮询回执（seal 到浏览器临时公钥），本地解密渲染                                      │
-└───────────────┬───────────────────────────────────────────────┬───────────────────────┘
-                │ POST /actions/workflows/control.yml/dispatches │ GET /contents/wxread-state/*
-                ▼                                                ▼
-┌──────────────────────────── GitHub Actions（唯一执行环境） ───────────────────────────┐
-│ read.yml     每天 01:07（北京时间）  逐账户阅读，逐次回写 cookie                        │
-│ warm.yml     每 6 小时              只做 renewal + 回写（≈40 秒/账户）                 │
-│ control.yml  按需                    qr / import / update / delete / schedule / test-* │
-│ pages.yml    推送 main               发布 web/                                          │
-│ tests.yml    PR / push 门禁          pytest + node 测试 + compileall + 明文密钥扫描     │
-└───────────────┬────────────────────────────────────────────────────────────────────────┘
-                │ CAS 写（带 sha PUT，失败回读比对再重试）
-                ▼
-┌──────────────────── 状态分支 wxread-state（只有密文） ────────────────────────────────┐
-│ control.json              { public_key, key_version, updated_at }                       │
-│ accounts/<id>.enc.json    每账户一份，含 cookie/headers/read_payload/状态               │
-│ settings.enc.json         计划、通知渠道、SMTP（密钥字段只存"已保存"标记）              │
-│ runs/<yyyy-mm>.enc.json   月度分片，保留 200 条                                          │
-└────────────────────────────────────────────────────────────────────────────────────────┘
-```
-
-### 2.1 模块边界与依赖方向
-
-依赖只允许向右：`worker → jobs → reader → state → crypto`，`accounts` 与 `notify` 为旁路；禁止反向 import，禁止 `reader` 直接读环境变量（配置由 `worker` 组装后注入）。
-
-| 模块 | 职责 | 明确不做 |
-|---|---|---|
-| `wxread/crypto.py` | X25519 sealed box（指令/回执）、SecretBox（状态）、AAD 绑定、key_version | 不生成业务密钥、不落盘 |
-| `wxread/state.py` | 分支读写、CAS（带 sha PUT + 回读比对）、分账户文件、月度 runs 裁剪到 200 | 不认识"账户"语义，只做字节与版本 |
-| `wxread/accounts.py` | 账户模型、字段校验、`needs_login`/`stopped` 迁移、旧 `WXREAD_CURL_BASH` / `WXREAD_ACCOUNTS_JSON` 导入 | 不发网络请求 |
-| `wxread/reader.py` | 单账户客户端：renewal、read、`Set-Cookie` 合并回调、L0–L3 判定 | 不写状态分支、不决定流程顺序 |
-| `wxread/jobs.py` | 串行队列、进度事件、取消、单账户 deadline | 不做重试策略（在 reader） |
-| `wxread/worker.py` | 子命令 `read` / `warm` / `migrate`；读 env、组装依赖、finally 落盘、决定退出码 | 不含协议细节 |
-| `wxread/qr.py` | 复用 runner 自带 Chrome 打开登录页、截图二维码、指纹去重；登录后让浏览器读一段书并抓 `web/book/read` | 不解析 cookie（交给 control 流程落盘） |
-| `wxread/capture.py` | 从浏览器发出的请求里挑出 `web/book/read`，解析成账户的 `read_payload` | 不启动浏览器、不发请求 |
-| `wxread/warm.py` | 只跑 renewal + 写回，连续 2 次 L3 才通知 | 不阅读 |
-| `wxread/notify.py` | 邮件 / PushPlus / 飞书 / Telegram；失败重试有上限 | 不含其它渠道 |
-| `web/` | 控制台（12 个组件，见 DESIGN §5） | 不内联令牌、不引构建 |
+# 当前架构与行为
 
----
+更新：2026-11-24。使用步骤见 [RUNBOOK.md](RUNBOOK.md)，修改、验证与升级见 [MAINTENANCE.md](MAINTENANCE.md)。[PLAN.md](PLAN.md) 是历史设计来源；这里描述实际实现。
 
-## 3. 状态分支与数据模型
+## 1. 托管方式
 
-分支 `wxread-state` 与 `main` 分离；写入只走 `state.py`。所有 `*.enc.json` 为 SecretBox 密文，明文结构只在本文件定义。
+唯一日常执行环境为 GitHub Actions，控制台由 GitHub Pages 发布。没有常驻后端、前端构建或本机定时器。浏览器连接可以关闭，云端阅读和续期继续运行。
 
-### 3.1 `control.json`（明文，仅公钥）
+~~~mermaid
+flowchart LR
+  U[静态控制台] -->|公钥加密指令| C[control.yml]
+  C --> S[wxread-state 密文状态]
+  R[read.yml: plan → 分片 read → report] --> S
+  W[warm.yml] --> S
+  S -->|密文读取 / 浏览器解密| U
+  R --> F[飞书批次摘要]
+  C --> Q[微信读书扫码与自动取参]
+~~~
 
-| 字段 | 类型 | 必填 | 约束 |
-|---|---|---|---|
-| `public_key` | base64(32B) | ✔ | X25519 公钥；替换需走 `key_version+1` |
-| `key_version` | int | ✔ | 从 1 起单调递增，新旧并存一轮 |
-| `updated_at` | ISO8601 | ✔ | UTC |
+| 工作流 | 触发与职责 |
+| --- | --- |
+| read.yml | 每天 UTC 17:07，即北京次日 01:07；手动可指定账户/间隔/截止 |
+| warm.yml | UTC 每 6 小时，即北京 02/08/14/20；只续期 |
+| control.yml | 页面或本地脚本 dispatch：init、qr、capture、update、delete、stop、schedule、notifications、test-mail/test-push；后端保留旧 import 兼容 |
+| tests.yml | main 推送、PR 和手动；Python/Node/静态/密钥扫描 |
+| pages.yml | main 的页面/视觉资源变化及手动；发布静态仓库内容，根 index.html 转到 web/ |
 
-### 3.2 `accounts/<id>.enc.json`
+read/warm 共享 wxread-session 并发组。control 按 session 分组；不同管理动作可并发，状态层负责保留双方修改。控制台发起的工作流使用 main；修复分支验收通过 GitHub dispatch 的 ref 显式选择分支。
 
-`<id>` = `sha256(account_uid)[:12]`，不含手机号/昵称；`account_uid` 取 `wr_vid` 派生的稳定值。
+## 2. 模块职责
 
-| 字段 | 类型 | 必填 | 默认 | 说明 / 迁移 |
-|---|---|---|---|---|
-| `schema_version` | int | ✔ | 1 | 缺省视为 1；升级只增字段不改语义 |
-| `id` | string(12) | ✔ | — | 与文件名一致，创建后不可变 |
-| `label` | string | ✔ | `账户-<id前4位>` | 页面展示名，≤ 24 字 |
-| `enabled` | bool | ✔ | `true` | `false` 不参与 read/warm |
-| `target_count` | int | ✔ | `40` | 每次阅读请求数；1 次 = 30 秒 |
-| `cookies` | object | ✔ | — | `wr_vid`、`wr_skey` 及其余登录 cookie；每次响应后合并 |
-| `headers` | object | ✔ | — | 抓取时的 UA 等；不含 `Cookie` 头 |
-| `read_payload` | object | ✔ | — | `appId`、`ps`、`pc`、`ci`、`co`、`sm`、`pr` —— 账户+设备维度，扫码/导入时写入 |
-| `renewed_at` | ISO8601 | ✔ | 导入时间 | 最近一次 renewal 成功时间 |
-| `last_ok_at` | ISO8601\|null | ✔ | `null` | 最近一次 `succ=1` 且含 `synckey` 的时间 |
-| `status` | enum | ✔ | `ok` | `ok` \| `needs_login` \| `stopped`；仅 L3 置 `needs_login`，人工或扫码成功置回 `ok` |
-| `note` | string | ✖ | `""` | 人工备注，不参与逻辑 |
+依赖主方向 worker → jobs → reader；state → crypto。业务配置由 worker 注入，reader 不读取环境变量。
 
-**不变量**
+| 文件 | 职责 |
+| --- | --- |
+| wxread/crypto.py | SecretBox 状态加密、上下文绑定；X25519/NaCl box 指令和回执 |
+| wxread/state.py | Contents API、分支准备、CAS 变更、运行幂等追加、密文读写 |
+| wxread/accounts.py | 账户模型、目标 1～200 次、数值兼容、Cookie/字段归一化、旧配置读取 |
+| wxread/capture.py | 监听浏览器请求和成功响应，只提升必要阅读字段 |
+| wxread/qr.py | Chrome/Chromium 登录页、干净二维码、换码、正文导航/下一页/自动取参 |
+| wxread/control.py | 指令验证、防重放、账户/设置变更、扫码与已有 Cookie 取参、加密回执 |
+| wxread/reader.py | renewal/read 协议、签名、错误 Cookie、有界恢复、读取预算 |
+| wxread/jobs.py | 每片串行账户执行、进度/取消、异常隔离、finally 落盘 |
+| wxread/warm.py | 独立续期、暂时故障重试、连续明确失效计数 |
+| wxread/notify.py | 四渠道发送，飞书签名/返回码检查，脱敏摘要 |
+| wxread/worker.py | 环境变量、命令组装、plan/read/report/warm/control/migrate 入口和退出码 |
+| web/gh.js | GitHub API、15 秒请求超时、取消信号、24 小时可选连接保存 |
+| web/crypto.js | 与 Python 互通的加解密 |
+| web/view-model.js | 北京日期/月份、近七日统计、排序、同 run 进度去重 |
+| web/app.js | 连接生命周期、局部行更新、扫码回执、任务跟踪、配置弹窗 |
+| web/style.css | 引用 docs/design/tokens.css；桌面右栏和手机卡片布局 |
 
-1. `cookies.wr_skey` 与 `renewed_at` 必须同一次写入（同一次 mutate 内），不允许只更新其一。
-2. `status=needs_login` 的账户在 `read` 中被跳过，但**不影响**其它账户。
-3. `read_payload` 里的 `b`/`c` 不入库；每次请求按该书真实章节列表抽取（修复 P5）。
-4. 任何字段缺失时按上表默认值补齐并在 `runs` 记录 `schema_filled`。
+## 3. 状态与密钥
 
-### 3.3 `settings.enc.json`
+默认分支 main 放程序，wxread-state 放状态。敏感内容在 *.enc.json 中加密，明文上下文绑定 owner/repo 与 key_version。
 
-| 字段 | 类型 | 说明 |
-|---|---|---|
-| `schedule` | object | `{read_cron: "0 7 1 * * "(北京 01:07 由 workflow 固定), warm_every_hours: 6}`；本字段只做页面展示与校验 |
-| `channels` | array | `["email","pushplus","feishu","telegram"]` 子集 |
-| `smtp` | object | `{host, port, user, from, to[]}`；**密码字段不落分支** |
-| `secrets_saved` | object | `{smtp_password: true, pushplus_token: false, ...}` 仅布尔，用于页面显示"已保存" |
+| 路径 | 内容 |
+| --- | --- |
+| control.json | 公钥与 key_version；公钥可公开 |
+| accounts/<id>.enc.json | 完整 cookies、headers、read_payload、目标、人工开关/备注、健康状态、progress |
+| settings.enc.json | 固定计划开关、通知选择和真实渠道口令，全部加密 |
+| runs/<UTC yyyy-mm>.enc.json | 月度运行记录，每月文件保留最新 200 条 |
+| sessions/<session>.enc.json | 已领取指令的 action、issued_at、claimed_at，用于防重放 |
+| responses/<session>.json | 封给发起者临时公钥的回执，包括 pending/capturing 和最终结果 |
+| responses/qr-<session>-<seq>-<fingerprint>.png | 短时二维码，页面只取本次会话；新扫码清理旧帧，保护半小时内的已领取会话 |
 
-### 3.4 `runs/<yyyy-mm>.enc.json`
+账户 id 从稳定 wr_vid 派生。同号重绑更新凭据并保留人工设置；停用账户重绑后仍需手动启用。
 
-数组，按 `started_at` 倒序；超过 200 条从尾部裁剪（同月分片内裁剪，不跨文件搬移）。
+WXREAD_STATE_KEY 是随机 32 字节对称密钥；WXREAD_CONTROL_SK 是独立指令私钥；control.json 存对应公钥。页面只需要 token 和状态密钥。正常升级保持密钥/版本不变，当前没有全量密钥轮换或跨仓库重新加密工具。
 
-| 字段 | 类型 | 说明 |
-|---|---|---|
-| `session_id` | string | 一次 workflow 运行 = 一个 session |
-| `account_id` | string | 对应 `accounts/<id>` |
-| `started_at` / `finished_at` | ISO8601 | 账户级起止 |
-| `read_count` / `target_count` | int | 完成次数 / 目标次数 |
-| `level` | enum | `L0` \| `L1` \| `L2` \| `L3` |
-| `reason` | string | 结构化原因码（`ok`、`net_timeout`、`err_-2012`、`no_synckey`、`renew_failed`、`payload_invalid`） |
-| `exit_code` | int | 账户级：0 成功、2 需重绑、3 失败 |
+Cookie/口令在 worker 内存和持有状态密钥的浏览器解密内存中使用；可选记住会在浏览器保存 token/状态密钥 24 小时。日志与通知不应含 Cookie 或渠道口令。本机真扫码工具可写忽略的凭据文件，维护者必须保密。
 
----
+## 4. 自动取参与控制链路
 
-## 4. 关键流程
+1. 浏览器生成 session、nonce 和临时回执密钥，用仓库公钥封指令，再 dispatch control。
+2. worker 解封并校验 action、session、nonce。60 秒新鲜度按 GitHub 接收该 run 的 created_at 计算，排队和安装耗时不使已接收指令过期。
+3. 以 create_only 领取 session 防重放，重复请求不覆盖原回执。
+4. qr 打开登录页并输出本次帧；扫描成功、等待手机确认时不主动重开页面。
+5. 确认登录后先回 pending/capturing，再进入真实 /web/reader/ 正文并主动翻页。
+6. 只有匹配阅读请求收到成功 succ/synckey 响应，才采用 appId/ps/pc/b/c/ci/co/sm/pr 等参数。保留数字、co=0、Origin/Referer，捕获结束再读取最新 Cookie。
+7. 通过 CAS 写账户，发最终加密回执。页面关闭二维码、刷新账户；取参未完成会自动再发 capture，用已有 Cookie 重试。
+8. capture 启动时记录旧凭据；期间已发生重新登录/参数更新时不覆盖新凭据，要求刷新后重试。
 
-### 4.1 首次连接（每个仓库一次）
+后端 import 仅为旧配置/维护兼容，页面没有 cURL 导入路径。取参失败给用户重试、确认正文可读或重新扫码的操作。
 
-1. 页面 GET `wxread-state/control.json`；不存在 → 展示"初始化"。
-2. 页面生成 X25519 密钥对 → 用 `secrets` 公钥（Actions 侧公钥，用户从仓库设置页复制）封私钥 → 用户点"写入密钥"，页面用 PAT 写 `WXREAD_CONTROL_KEY`（需 `secrets:write`，仅此一次）。
-3. 页面用 PAT 写 `WXREAD_STATE_KEY`（32B 随机，页面生成）—— 状态对称密钥不再从私钥派生。
-4. 本机 `scripts/keygen.py` 生成密钥对；页面或 workflow 只把**公钥**交给 worker，动作 `init` 写 `control.json`（公钥 + `key_version=1`）。私钥永不进日志。
-5. 页面轮询 `runs` 最新回执，解出 `ready`。
+## 5. 阅读、分片与落盘
 
-### 4.2 扫码绑定
+plan 加载账户和开关，按账户目标、间隔与网络余量计算预算。每片最多 5 账户，预算不超过约 330 分钟加启动余量；最多 3 片并行。每片内部串行，一个账户失败继续后续账户。
 
-1. 页面 `seal({action:"qr", session_id, issued_at, nonce}, repo_public_key)` → dispatch `control.yml`。
-2. worker 校验 60 秒窗口 + nonce 未用 → 启动 runner 自带 Chrome 打开 `weread.qq.com` 登录页 → 截图二维码 → 写 `responses/<session>.enc.json`（seal 到浏览器临时公钥）。
-3. 页面显示二维码，轮询回执；手机确认后 worker 抓取会话 cookie、`appId/ps/pc`，`accounts/<id>.enc.json` 落盘（同 `account_uid` 走 update，不新增）。
-4. 超时（默认 180 秒）→ 回执写 `qr_timeout`，页面提示"改用 cURL 导入"。
+手动 workflow_dispatch 绕过自动总开关。可用 account_ids 指定账户；为空运行全部。正常跳过停用或 needs_login 账户，汇总仍说明启用但需处理的账户。
 
-### 4.3 cURL 导入（逃生门）
+Reader 的第一次读取也等待 pace（默认 30 秒）。默认目标 40 次不能使用 1200 秒固定 deadline；自动预算还包含请求及恢复余量。用户正数 deadline 为刻意提前停止的上限。
 
-页面粘贴 curl bash → 本地解析出 cookies/headers/data（复用 `config.py:106-138` 的规则）→ seal 后 dispatch `import` → worker 校验字段齐全（`appId/ps/pc` 必须存在）→ 写账户；缺字段则回执 `missing_fields:[...]`。
+每次响应合并 Cookie，包括非 2xx 或非法 JSON；变化即时尝试回写。每 10 次读取保存进度，finally 保存最终账户与记录；SIGINT/SIGTERM 请求有界停止。强制杀死或 GitHub 不可写时只能保留已写入内容。
 
-### 4.4 每日 read（read.yml）
+运行字段只与最新状态按字段合并，保留并发备注、目标、启用设置和重新绑定凭据。删除不复活。run_id 防同次记录重复，batch_id 关联矩阵分片；report 在分片结束后汇总一批。没有最终记录但已有当前 batch 进度时，按中断结果纳入摘要。
 
-1. checkout `main` → `wxread-state`（仅该分支，浅克隆）→ 解出全部账户。
-2. 账户数 > 5 时由 `control.yml` 分片 dispatch，每片 ≤ 5 账户（见 §6）。
-3. 逐账户串行：`renewal(strict=False)` → 循环 read → 每次响应合并 `Set-Cookie` → 每 5 分钟或每 40 次 CAS 写回一次 → finally 强制写回。
-4. 单账户 deadline 20 分钟；到达即停，写 `reason=deadline`，继续下一账户。
-5. 全部账户结束 → 汇总 `runs` → 按 L1–L3 规则决定是否通知 → 退出码见 §5.3。
+单账户 stop 指令必须匹配 account_id + run_id，写当前 progress 的 cancel_requested。新运行初始化取消标志，旧 stop 不会取消新任务。「全部停止」取消 read 工作流，不取消其他 control。
 
-### 4.5 warm（warm.yml，每 6 小时）
+## 6. 失败与通知
 
-只对 `enabled && status=ok` 的账户调 `renewal`，写回 `cookies.wr_skey` + `renewed_at`；不做 read。连续 2 次 L3 才推送"请重新扫码"。
+| 级别 / 情况 | 行为 |
+| --- | --- |
+| L0 | 正常读取 |
+| L1 | 暂时网络/服务故障，退避重试，有次数限制；不把网络故障永久标为需要登录 |
+| L2 | 章节/会话恢复等有界补救；记录是否完成目标 |
+| L3 | 明确登录失效或参数无法恢复；该账户待处理，不影响其他账户 |
+| warm | 暂时失败继续下次尝试；连续两次明确登录失效才通知一次；成功清零 |
+| 通知发送失败 | 不删除阅读结果；report 报告发送失败，需修正渠道配置 |
 
-### 4.6 页面刷新
+飞书在每天读后发送一条批次摘要，L0/L1 成功也发，L2 恢复完成目标算成功。其他渠道保持 L2/L3 异常提醒，避免给飞书再发同批重复异常消息。停用自动计划时不发正常日常摘要；用户重跑整个 workflow 是新的发送，当前没有跨重跑的通知去重。
 
-轮询 `runs`（30 秒）→ 只按 `data-key` patch 文本/属性；结构变化才重建。编辑区在轮询期间暂停重绘（保焦点、滚动、IME）。连接状态圆点：≤ 30 秒 `--ok-*`，> 30 秒 `--warn-*`，> 2 分钟 `--danger-*`，禁止恒绿。
+FEISHU_WEBHOOK 兼容迁入加密设置；已保存的用户渠道开关不被自动覆盖。飞书可配置 secret 做 HMAC 签名，并检查 JSON 成功码；HTTP 失败只输出脱敏信息。
 
----
+| 退出码 | 含义 |
+| --- | --- |
+| 0 | 正常、明确跳过或部分成功；必须结合账户结果判断 |
+| 1 | 全部读取失败 / 汇总发送失败 |
+| 2 | 配置缺失 |
+| 4 | 状态持久化失败 |
 
-## 5. 失败处理
+## 7. 页面数据与容量
 
-### 5.1 分级（判据写死）
+北京日期用 UTC+8 归属；七日跨月时读取需要的 UTC 月份文件。当前只展示读取到的最近记录，最多 100 条；每月底层文件上限为 200 条。按 run_id 去重最终记录与正在执行的 progress。
 
-| 级别 | 判据 | 动作 | 通知 |
-|---|---|---|---|
-| L0 | `succ=1` 且含 `synckey` | 继续 | 否 |
-| L1 | 网络异常 / 5xx，次数 < 3 | 退避 5/15/45 秒后重试 | 否 |
-| L2 | `errCode ∈ {-2012,-2013}` 或连续 3 次失败 | 强制 renewal → 重试 1 轮 | 是（"已自愈/未自愈"） |
-| L3 | renewal 拿不到 `wr_skey`，或 `ReadPayloadError` 经 chapterInfos 重试仍失败 | 该账户置 `needs_login` 并停止；其它账户继续 | 是（"重新扫码"） |
+连接默认内存保存，记住 24 小时才写本机。断开递增连接 epoch 并 AbortController 中止请求、轮询与旧回调。扫码会话的临时回执钥可在当前 tab 会话中恢复，不公开到仓库。
 
-### 5.2 重试预算
+默认一个账户约 20 分钟/天，保活另用少量 runner 时间。公开/私有仓库的额度与计费以 GitHub 账户实际政策为准；不能把完整阅读算成每次不到 2 分钟。状态提交历史会累积，归档前需备份，当前不自动清空 Git 历史。
 
-- 单请求：`REQUEST_TIMEOUT = 10s`（沿用 `main.py:21`），只对幂等读取重试。
-- 单账户：L1 退避 3 次封顶；L2 全流程最多 1 轮补救；总时长 ≤ 20 分钟。
-- 全局：workflow `timeout-minutes` 与分片挂钩，超时前必须已落盘（finally）。
+## 8. 维护边界
 
-### 5.3 退出码（workflow 级）
-
-| 情形 | 退出码 | 说明 |
-|---|---|---|
-| 全部账户 L0 | 0 | 绿 |
-| 部分成功、部分 L2/L3 | 0 | 黄：通知说明，不红灯 |
-| 全部账户失败 | 1 | 红 |
-| 状态写回失败（CAS 冲突超限） | 4 | 红，优先排查 |
-
----
-
-## 6. 容量与成本
-
-- read：40 次 × 30 秒 ≈ 20 分钟/账户/天。
-- warm：4 次/天 × ≈1 分钟/账户 ≈ 120 分钟/月/账户。
-- 公开仓库 Actions 免费；私有仓库按 2000 分钟/月免费额度估算，> 2 账户需启用"仅 warm + 每周一次完整阅读"低耗模式（P6 提供）。
-- 分片：账户数 > 5 → 每片 5 个 dispatch，规避 6 小时上限；每片独立 `session_id`。
-
----
-
-## 7. 目录规划（P1 之后落地）
-
-```
-wxread/                 crypto.py  state.py  accounts.py  reader.py  jobs.py  worker.py  qr.py  capture.py  warm.py  notify.py
-web/                    index.html  assets/app.js  assets/components.js  assets/style.css
-docs/                   ARCHITECTURE.md  THREAT-MODEL.md  DESIGN.md  REVIEW.md  PLAN.md  RUNBOOK.md( P6 )
-docs/design/            tokens.css  variant-steel.html  final-A-1280.png  final-A-390.png  README.md
-docs/reviews/           G0-requirements.md  G1-design.md  （后续 G2/G3 记录）
-tests/                  test_state_roundtrip.py  test_reader.py  test_accounts_migrate.py
-.github/workflows/      read.yml  warm.yml  control.yml  pages.yml  tests.yml
-requirements.txt        requests  PyNaCl  playwright（版本锁死，P6）
-```
-
-**禁止**：`templates/`、`static/`、`web.py`、`scheduler.py`（仓库本就不存在，禁止回填）、`docker-publish.yml`、任何 UI 框架或打包器。
-
----
-
-## 8. 迁移与回滚
-
-- 开关：`WXREAD_MODE=legacy|v4`（默认 `legacy` 直到 P4 验证完 3 天）。
-- P1–P3 期间 `main.py` 保持可跑；v4 只新增代码与工作流，不改旧路径行为。
-- 旧 secret `WXREAD_CURL_BASH` / `WXREAD_ACCOUNTS_JSON` 只读兼容，日志标注 `deprecated`；清理时点在 P6 文档中给出。
-- 回滚：`git revert` 单个 PR 即可；状态分支保留，不随代码回滚删除（`key_version` 兼容一轮）。
-
----
-
-## 9. 四问直答（G0 验收口径）
-
-1. **数据在哪**：明文只在两处——微信读书会话（服务端）与用户浏览器内存；仓库分支只有密文与公钥；Secrets 只有两把密钥与通知 token。
-2. **谁能读**：仓库写权限者能读密文（无密钥不可解）；页面持有 PAT 者可发指令；回执只有发起页面能解；日志只留前 2 位。
-3. **失败怎么办**：L0 继续、L1 退避、L2 自愈一轮、L3 停该账户并通知；状态写回在 finally，CAS 冲突有界重试；部分成功不红灯。
-4. **怎么算完成**：`runs` 出现当日 `L0` 且 `read_count == target_count`；`accounts/<id>.enc.json` 的 `wr_skey`/`renewed_at` 已变化；页面 200 且连接圆点为 `--ok-*`；通知在 L2/L3 时到达。
-
----
-
-## 10. 附：PLAN 与仓库现状差异（G1 需裁决）
-
-| PLAN 表述 | 仓库实际 | 处理建议 |
-|---|---|---|
-| §9 删除 `notifications.py` 的企微/钉钉/Webhook 分支 | 文件是 `push.py`，无企微/钉钉/Webhook；但 `push.py:74-115` 仍有 WxPusher / ServerChan | P6 删除这两个渠道，日志标 `deprecated` |
-| §9 删除 `templates/`、`static/`、`web.py`、`scheduler.py` | 均不存在 | 仅作为"禁止回填"约束写入 §7 |
-| §9 删除 `Dockerfile`、`docker-compose.yml` | `Dockerfile` 存在；`docker-compose.yml` 不存在 | P6 删 `Dockerfile`，同步删 README「方法二」 |
-| §2.2 双份前端已分叉（`web.py:81`） | 属参考项目 `wbshm/wxread`，非本仓库 | 仅作反面案例，不产生删除项 |
-| §9 删除 `docker-publish.yml` | 不存在 | 无需动作 |
-| 每日 01:07 | `deploy.yml:10` 为 `0 17 * * *`（北京 01:00） | 改 `read.yml` 时统一 01:07，并核对 UTC |
-| `checkout@v2` / `setup-python@v2` | 实际在 `deploy.yml:32`、`deploy.yml:35` | P6 升 v4/v5 |
-| README 称"60 分钟 / 一次部署无需操作" | `config.py:12` 默认 40 次（20 分钟）；续期结果不落盘 | README 随 P6 重写 |
+不引入 templates/static/web.py/scheduler.py、Docker 或第三方 UI 框架。改微信网页选择器时看真实页面；改协议时看真实请求与响应；改 GitHub/通知时跑真实云端验证。历史需求与本轮证据见 docs/reviews；外部服务的验证等级必须明确区分。

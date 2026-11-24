@@ -61,7 +61,9 @@ def render_run_report(records: list[Mapping]) -> tuple[str, str]:
 
 
 def render_daily_report(records: list[Mapping], accounts: list[Mapping]) -> tuple[str, str]:
-    by_account = {str(record.get("account_id")): record for record in records}
+    by_account: dict[str, Mapping] = {}
+    for record in sorted(records, key=lambda item: str(item.get("started_at") or item.get("updated_at") or "")):
+        by_account[str(record.get("account_id"))] = record
     enabled = [account for account in accounts if account.get("enabled", True)]
     completed = 0
     total_reads = sum(int(record.get("read_count") or 0) for record in records)

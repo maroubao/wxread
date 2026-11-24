@@ -224,7 +224,7 @@ def _capture_read_payload(page: Any) -> tuple[dict[str, Any], dict[str, str]]:
         return {}, {}
     try:
         captured, headers = capture()
-    except Exception as exc:  # noqa: BLE001 - 抓包失败只能退回手工补
+    except Exception as exc:  # noqa: BLE001 - 捕获失败后可用已保存登录态自动重试
         log.warning("自动抓取阅读参数失败：%s", scrub(str(exc)))
         return {}, {}
     if not captured:

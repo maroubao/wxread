@@ -1,7 +1,7 @@
 // 原生控制台，所有管理指令在浏览器加密后直连GitHub。
-import * as gh from "./gh.js?v=3";
-import * as c from "./crypto.js?v=3";
-import * as vm from "./view-model.js?v=3";
+import * as gh from "./gh.js?v=4";
+import * as c from "./crypto.js?v=4";
+import * as vm from "./view-model.js?v=4";
 
 const $ = id => document.getElementById(id);
 const state = {
@@ -386,6 +386,11 @@ function renderChart() {
   $("chart-empty").hidden = !empty;
 }
 function renderAll() {
+  const hostOwner = location.hostname.endsWith(".github.io") ? location.hostname.slice(0, -10) : "";
+  const siteRepo = location.pathname.split("/").filter(Boolean)[0];
+  const repo = state.cfg.repo || (hostOwner && siteRepo ? hostOwner + "/" + siteRepo : "maroubao/wxread");
+  $("manual-link").href = "https://github.com/" + repo + "/blob/main/docs/RUNBOOK.md";
+  $("maintenance-link").href = "https://github.com/" + repo + "/blob/main/docs/MAINTENANCE.md";
   const connected = state.status === "connected";
   const data = vm.summary(state.accounts, state.runs);
   putText($("m-read"), connected && data.hasToday ? vm.minutes(data.readCount) : "—");

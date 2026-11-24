@@ -35,3 +35,12 @@ def test_feishu_signature_and_response_are_validated(monkeypatch):
     assert notify.send_feishu({"webhook": "fixture", "secret": "signing-key"}, "title", "text") == ""
     expected = base64.b64encode(hmac.new(b"1000\nsigning-key", b"", hashlib.sha256).digest()).decode()
     assert seen[0]["sign"] == expected
+
+
+def test_retried_batch_reports_latest_account_result():
+    records = [
+        {"account_id": "one", "started_at": "2026-11-24T01:00:00Z", "read_count": 40, "target_count": 40, "exit_code": 0},
+        {"account_id": "one", "started_at": "2026-11-24T00:00:00Z", "read_count": 0, "target_count": 40, "exit_code": 3},
+    ]
+    title, message = notify.render_daily_report(records, [{"id": "one", "label": "主号", "target_count": 40}])
+    assert "1/1" in title and "完成" in message and "未完成" not in message

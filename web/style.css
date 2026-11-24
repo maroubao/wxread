@@ -68,6 +68,8 @@ body.loading .metric .value strong { min-width: var(--sp-8); color: var(--text-3
 .section-head .sub { margin-top: var(--sp-1); }
 .count { color: var(--text-3); font-size: var(--fs-sm); font-weight: 400; }
 .history { margin-top: var(--sp-5); }
+.help-links { display: flex; flex-wrap: wrap; gap: var(--sp-4); margin-top: var(--sp-5); }
+.help-links a { display: inline-flex; align-items: center; min-height: var(--sp-7); }
 .table-card { overflow: clip; }
 table { width: 100%; border-collapse: collapse; text-align: left; table-layout: fixed; }
 thead { background: var(--surface-2); }

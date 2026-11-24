@@ -15,7 +15,7 @@
     WXREAD_ACCOUNTS_JSON     旧配置（多账户数组），迁移用
     WXREAD_TARGET_COUNT      覆盖账户默认目标数
     WXREAD_PACE              两次阅读间隔秒数（测试用，默认 30）
-    WXREAD_DEADLINE          单账户上限秒数（默认 1200）
+    WXREAD_DEADLINE          单账户上限秒数（0 按目标与请求余量计算）
     WXREAD_KEYS              轮换期旧密钥，形如 "1:<b64>,2:<b64>"
 """
 
@@ -305,7 +305,7 @@ def cmd_read(store: StateStore, env: Mapping[str, str], transport_factory=None, 
     if selected:
         accounts = [account for account in accounts if account.id in selected]
     if not accounts:
-        log.error("没有任何账户：先扫码绑定或导入 curl")
+        log.error("没有任何账户：先在控制台扫码绑定")
         return EXIT_CONFIG
     pace, deadline = read_options(env)
     runner = JobRunner(
@@ -372,7 +372,7 @@ def cmd_warm(store: StateStore, env: Mapping[str, str], transport_factory=None, 
         return EXIT_OK
     accounts = load_accounts(store, env)
     if not accounts:
-        log.error("没有任何账户，先扫码绑定或导入 curl")
+        log.error("没有任何账户，先在控制台扫码绑定")
         return EXIT_CONFIG
     summary = warm_mod.warm_all(
         store,
