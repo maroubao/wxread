@@ -1,7 +1,7 @@
 // 原生控制台，所有管理指令在浏览器加密后直连GitHub。
-import * as gh from "./gh.js?v=4";
-import * as c from "./crypto.js?v=4";
-import * as vm from "./view-model.js?v=4";
+import * as gh from "./gh.js?v=5";
+import * as c from "./crypto.js?v=5";
+import * as vm from "./view-model.js?v=5";
 
 const $ = id => document.getElementById(id);
 const state = {
@@ -10,7 +10,7 @@ const state = {
   controller: null, refreshTimer: null, refreshing: false, syncedAt: 0, revision: null,
   cache: new Map(), sessions: new Map(), tracks: new Map(),
   accountActions: new Set(),
-  qrSession: null, qrPolling: null, qrUrl: null, askingQr: false,
+  qrSession: null, qrAttempt: null, qrPolling: null, qrUrl: null, askingQr: false,
   editId: null, deleteId: null, expiresAt: 0,
 };
 const accountRows = new Map();
@@ -72,6 +72,7 @@ function stopConnection(preserveQr = false) {
   state.accountActions.clear();
   state.cache.clear();
   state.qrSession = null;
+  state.qrAttempt = null;
   state.qrPolling = null;
   state.askingQr = false;
   state.refreshing = false;
@@ -429,7 +430,7 @@ function renderAll() {
 function requireConnection() {
   if (state.status !== "connected" || !state.publicKey) throw new Error("先连接仓库。");
 }
-async function dispatchInstruction(action, payload) {
+async function dispatchInstruction(action, payload, onPrepared) {
   requireConnection();
   const id = crypto.randomUUID().replaceAll("-", "").slice(0, 24);
   const reply = c.newKeypair();
@@ -440,12 +441,14 @@ async function dispatchInstruction(action, payload) {
     nonce: c.b64e(c.randomBytes(12)), payload, reply_key: c.b64e(reply.publicKey),
   }, state.publicKey);
   try {
+    if (onPrepared && onPrepared(session) === false) throw aborted();
     await gh.dispatchWorkflow(session.cfg, "control.yml", { control: "instruction", instruction: JSON.stringify(envelope), session_id: id });
   } catch (error) {
-    if ([401, 403, 404, 422].includes(error.status) || error.name === "AbortError") { endSession(id); throw error; }
+    if (session.cancelled || [401, 403, 404, 422].includes(error.status) || error.name === "AbortError") { endSession(id); throw session.cancelled ? aborted() : error; }
     say("提交状态待确认，正在检查同一条指令回执。", "warn");
   }
   check(session.epoch);
+  if (session.cancelled) { endSession(id); throw aborted(); }
   return session;
 }
 function decryptReceipt(session, file) {
@@ -491,6 +494,8 @@ function showQrPanel(live) {
 function clearQrSession() {
   const session = state.qrSession;
   state.qrSession = null;
+  state.qrAttempt = null;
+  state.askingQr = false;
   try { sessionStorage.removeItem("wxread.qr.v2"); } catch { /* 私密模式 */ }
   if (session) endSession(session.id);
   releaseQrImage();
@@ -561,6 +566,7 @@ async function pollQr(startedAt = Date.now(), shownPath = null) {
           } else if (!shownPath) putText($("qr-slot"), "正在等待Actions生成二维码…");
         }
       } catch (error) {
+        if (session.cancelled) return;
         if (state.qrSession?.id !== sessionId) throw error;
         if (error.name === "AbortError" || [401, 403].includes(error.status)) throw error;
         putText($("qr-hint"), "暂未确认绑定结果：" + error.message);
@@ -579,9 +585,20 @@ async function pollQr(startedAt = Date.now(), shownPath = null) {
 async function askQr() {
   if (state.qrSession || state.askingQr) return;
   state.askingQr = true;
+  const attempt = { session: null, cancelPromise: null };
+  state.qrAttempt = attempt;
   updateButtons();
   try {
-    const session = await dispatchInstruction("qr", { label: $("inp-qr-label").value.trim(), timeout: 600 });
+    const session = await dispatchInstruction("qr", { label: $("inp-qr-label").value.trim(), timeout: 600 }, prepared => {
+      attempt.session = prepared;
+      return state.qrAttempt === attempt;
+    });
+    if (state.qrAttempt !== attempt) {
+      session.cancelled = true;
+      endSession(session.id);
+      await (attempt.cancelPromise || cancelControlRun(session));
+      return;
+    }
     state.qrSession = session;
     showQrPanel(true);
     putText($("qr-slot"), "正在生成二维码…");
@@ -589,7 +606,10 @@ async function askQr() {
       sessionStorage.setItem("wxread.qr.v2", JSON.stringify({ id: session.id, repo: state.cfg.repo, branch: state.cfg.branch, secret: c.b64e(session.secret), startedAt: session.startedAt }));
     } catch { /* 私密模式仅使用内存 */ }
     await pollQr(session.startedAt);
-  } finally { state.askingQr = false; updateButtons(); }
+  } finally {
+    if (state.qrAttempt === attempt) { state.qrAttempt = null; state.askingQr = false; }
+    updateButtons();
+  }
 }
 function restoreQrSession() {
   try {
@@ -605,15 +625,33 @@ function restoreQrSession() {
     pollQr(session.startedAt).catch(reportError);
   } catch { /* 无可恢复扫码会话 */ }
 }
+async function cancelControlRun(session) {
+  const until = Date.now() + 30000;
+  do {
+    const runs = await gh.listRuns(session.cfg, "control.yml");
+    const mine = runs.find(run => String(run.display_title || "").includes(session.id));
+    if (mine) {
+      if (mine.status !== "completed") await gh.cancelRun(session.cfg, mine.id);
+      return true;
+    }
+    await delay(1000, session.cfg.signal);
+  } while (Date.now() < until);
+  return false;
+}
 async function cancelQr() {
-  const session = clearQrSession();
+  const attempt = state.qrAttempt;
+  const pending = attempt?.session;
+  const session = clearQrSession() || pending;
   showQrPanel(false);
   closeDialog("qr-dialog");
+  updateButtons();
   if (!session) return;
-  const runs = await gh.listRuns(session.cfg, "control.yml");
-  const mine = runs.find(run => String(run.display_title || "").includes(session.id) && run.status !== "completed");
-  if (mine) await gh.cancelRun(session.cfg, mine.id);
-  say("本次绑定已取消。");
+  session.cancelled = true;
+  endSession(session.id);
+  const cancellation = cancelControlRun(session);
+  if (attempt) attempt.cancelPromise = cancellation;
+  const confirmed = await cancellation;
+  if (current(session.epoch)) say(confirmed ? "已请求取消本次绑定。" : "绑定窗口已关闭，取消运行尚未确认，可在Actions检查。", confirmed ? "" : "warn");
 }
 function openQr(label = "") {
   requireConnection();
@@ -789,6 +827,9 @@ function bind() {
   for (const button of document.querySelectorAll("[data-close]")) button.addEventListener("click", () => button.closest("dialog").close());
   for (const dialog of document.querySelectorAll("dialog")) dialog.addEventListener("close", () => {
     for (const input of dialog.querySelectorAll('input[type="password"]')) if (dialog.id !== "connect-dialog") input.value = "";
+  });
+  $("qr-dialog").addEventListener("close", () => {
+    if (state.qrSession || state.qrAttempt) cancelQr().catch(reportError);
   });
   $("qr-dialog").addEventListener("cancel", event => { event.preventDefault(); cancelQr().catch(reportError); });
   click("btn-config", () => showDialog("connect-dialog"));

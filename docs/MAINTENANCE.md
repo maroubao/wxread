@@ -131,6 +131,14 @@ CI 的 tests.yml 执行同类检查。只跑与更改相关的回归用于实现
 
 本机真扫码脚本可用 scripts/qr_local.py、scripts/live_check.py。它们产生的 .qr-cookies.json 等文件含凭据，只留本机、已被 Git 忽略。不要打印内容或为了复现而上传。
 
+### 控制台的可重复本机验收
+
+在根目录执行 python tests/browser_fixture.py，终端打印 localhost 地址、fixture/wxread、fixture-token 和一把固定的测试状态密钥。打开打印的地址，仅填写这些测试值；页面标有「本机测试数据」。二维码、读取与发送使用替身，不访问真实微信/飞书，也不写 GitHub。
+
+扫码备注填 cancel-delay 会使提交响应延迟 8 秒：点生成后立刻关闭、按 Esc 或取消，应回到总览；响应晚到后不会重新启动本页扫码，测试接口 /_test/snapshot 中仅对应 control 的 conclusion=cancelled，账户数不增加。普通备注模拟登录成功，用于验收取参进度与窗口收起。其他表单可以通过真实加密指令、处理器和回执验证渲染。
+
+此工具用于 UI 生命周期和操作契约，不能代替真实扫码、Reader、Actions 或通知送达验收。结束后 Ctrl+C 停止服务。
+
 ## 5. 需要遵守的实现约定
 
 ### 5.1 账户与状态

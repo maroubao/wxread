@@ -450,17 +450,21 @@ class StateStore:
         def update(current: dict | None) -> dict | None:
             if current is None:
                 return dict(account) if baseline is None else None
-            credential_changed = current.get("cookies") != previous.get("cookies") and current.get("cookies") != account.get("cookies")
+            credential_changed = any(current.get(name) != previous.get(name) and current.get(name) != account.get(name) for name in ("cookies", "headers", "read_payload", "credential_revision"))
             for name in fields:
                 if name not in account or account.get(name) == previous.get(name):
                     continue
-                if credential_changed and name in {"cookies", "renewed_at", "status", "note"}:
+                if credential_changed and name in {"cookies", "renewed_at", "last_ok_at", "status", "note", "warm_failures", "warm_notified"}:
                     continue
                 value = account[name]
                 old = previous.get(name)
                 if isinstance(value, dict):
                     existing = dict(current.get(name) or {})
                     old = old if isinstance(old, dict) else {}
+                    if name == "progress" and value.get("run_id") != old.get("run_id"):
+                        if existing.get("run_id") == old.get("run_id"):
+                            current[name] = dict(value)
+                        continue
                     for key, item in value.items():
                         if item != old.get(key) and existing.get(key) == old.get(key):
                             existing[key] = item

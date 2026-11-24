@@ -306,6 +306,7 @@ class Reader:
         while outcome.read_count < account.target_count:
             if self.should_stop():
                 outcome.raise_level("L2" if outcome.read_count else "L1", "cancelled")
+                outcome.reason = "cancelled"
                 break
             if self.clock() - started > self.deadline:
                 outcome.raise_level("L2", "deadline")

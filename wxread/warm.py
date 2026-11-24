@@ -68,10 +68,16 @@ def warm_account(
     result = WarmResult(account_id=account.id, label=account.label)
     try:
         baseline = store.load_account(account.id)
-    except StateError as exc:
+        if baseline is not None:
+            account = Account.from_dict(baseline, account.id)
+            result.label = account.label
+    except (StateError, ValueError, TypeError) as exc:
         return WarmResult(account.id, account.label, reason=WARM_REASON_STATE, level="L2", note=scrub(str(exc)))
     if baseline is None:
         return WarmResult(account.id, account.label, reason=WARM_REASON_SKIPPED, note="账户已删除")
+    legacy = account.status == "needs_login" and "warm_failures" not in account.extra and account.note.startswith("renewal")
+    if not account.enabled or (account.status != "ok" and not legacy):
+        return WarmResult(account.id, account.label, reason=WARM_REASON_SKIPPED, note=account.note or "已停用", level="L3" if account.status == "needs_login" else "L0", notify=account.status == "needs_login" and int(account.extra.get("warm_failures", 0)) >= 2 and not account.extra.get("warm_notified", False))
     try:
         skey = reader_mod.Reader(account, transport_factory()).renew()
         account.mark_renewed(skey, now_iso())
@@ -102,7 +108,9 @@ def warm_account(
         result.note = scrub(str(exc))
     try:
         saved = store.save_account_runtime(account.to_dict(), baseline, f"chore(state): warm {account.id}")
-        if saved is None:
+        latest = Account.from_dict(saved, account.id) if saved is not None else None
+        different_session = latest is not None and (any(getattr(latest, name) != getattr(account, name) for name in ("cookies", "headers", "read_payload")) or latest.extra.get("credential_revision") != account.extra.get("credential_revision"))
+        if saved is None or different_session:
             result.ok = False
             result.reason = WARM_REASON_SKIPPED
             result.notify = False
@@ -136,14 +144,6 @@ def warm_all(
     else:
         items = list(accounts)
     for account in items:
-        legacy_warm_failure = account.status == "needs_login" and "warm_failures" not in account.extra and account.note.startswith("renewal")
-        if not account.enabled or (account.status != "ok" and not legacy_warm_failure):
-            summary.results.append(WarmResult(
-                account.id, account.label, reason=WARM_REASON_SKIPPED, note=account.note or "已停用",
-                level="L3" if account.status == "needs_login" else "L0",
-                notify=account.status == "needs_login" and int(account.extra.get("warm_failures", 0)) >= 2 and not account.extra.get("warm_notified", False),
-            ))
-            continue
         result = warm_account(store, account, transport_factory=transport_factory, now_iso=now_iso)
         log.info("保活 %s：%s", account.id, result.reason)
         summary.results.append(result)

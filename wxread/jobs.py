@@ -70,7 +70,13 @@ class JobRunner:
             return False
         if current is None:
             return self._baselines.get(account.id) is not None
-        return current.get("enabled") is False or current.get("status") != STATUS_OK or bool((current.get("progress") or {}).get("cancel_requested"))
+        baseline = self._baselines.get(account.id) or {}
+        changed = any(current.get(name) != baseline.get(name) for name in ("cookies", "headers", "read_payload", "credential_revision"))
+        progress = current.get("progress") or {}
+        own_run = account.extra["progress"]["run_id"]
+        replaced = bool(progress.get("run_id") and progress["run_id"] != own_run)
+        cancelled = progress.get("run_id") == own_run and progress.get("cancel_requested")
+        return changed or replaced or current.get("enabled") is False or current.get("status") != STATUS_OK or bool(cancelled)
 
     def _sleep(self, seconds: float) -> None:
         if self.sleep is not time.sleep:
@@ -107,6 +113,11 @@ class JobRunner:
             loaded = self.store.load_account(account.id)
             if loaded is not None or not self.existing_only:
                 self._baselines[account.id] = loaded
+            if loaded is not None:
+                latest = Account.from_dict(loaded, account.id)
+                for name in ("cookies", "headers", "read_payload", "status", "note", "renewed_at", "last_ok_at", "label", "enabled"):
+                    setattr(account, name, getattr(latest, name))
+                account.extra.update({key: value for key, value in latest.extra.items() if key != "progress"})
             self._save(account)
             reader = Reader(
                 account,
@@ -135,6 +146,9 @@ class JobRunner:
             count = int(account.extra["progress"].get("read_count", 0))
             outcome = Outcome("L2" if count else "L1", "cancelled", count, account.target_count, exit_code=2 if count else 3)
         finally:
+            if outcome.read_count < account.target_count and self._stop_account(account):
+                outcome.reason = "cancelled"
+                outcome.exit_code = 2 if outcome.read_count else 3
             finished_at = utcnow_iso()
             record = outcome.as_run(account.id, started_at, finished_at)
             record.update({"run_id": run_id, "label": account.label})
@@ -162,7 +176,7 @@ class JobRunner:
         baseline = self._baselines.get(account.id)
         fresh = account.to_dict()
         if account.id in self._superseded and baseline is not None:
-            for name in ("cookies", "renewed_at", "status", "note"):
+            for name in ("cookies", "headers", "read_payload", "credential_revision", "renewed_at", "last_ok_at", "status", "note", "warm_failures", "warm_notified"):
                 fresh[name] = baseline.get(name)
         try:
             saved = self.store.save_account_runtime(fresh, baseline, f"chore(state): progress {account.id}")
@@ -170,7 +184,10 @@ class JobRunner:
                 self._superseded.add(account.id)
                 return
             self._baselines[account.id] = saved
-            if saved.get("cookies") != account.cookies or saved.get("enabled") is False or saved.get("status") != STATUS_OK:
+            latest = Account.from_dict(saved, account.id)
+            different_session = any(getattr(latest, name) != getattr(account, name) for name in ("cookies", "headers", "read_payload")) or latest.extra.get("credential_revision") != account.extra.get("credential_revision")
+            different_run = (saved.get("progress") or {}).get("run_id") != account.extra["progress"]["run_id"]
+            if different_session or different_run or saved.get("enabled") is False or saved.get("status") != STATUS_OK:
                 self._superseded.add(account.id)
         except StateError as exc:
             if strict:

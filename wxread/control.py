@@ -15,6 +15,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping
+from uuid import uuid4
 
 from . import notify, qr
 from .accounts import Account, MissingFieldsError, account_from_curl, clamp_target_count, normalize_read_payload
@@ -203,6 +204,7 @@ def handle_qr(ctx: ControlContext, payload: Mapping[str, Any]) -> dict:
             merged = _merge_accounts(existing, account) if existing is not None else account
             if merged.read_payload.get("ps") and merged.read_payload.get("pc"):
                 merged.note = ""
+            merged.extra["credential_revision"] = uuid4().hex
             return merged.to_dict()
 
         saved = ctx.store.mutate_account(account.id, bind, "control: qr bind")
@@ -257,11 +259,12 @@ def handle_capture(ctx: ControlContext, payload: Mapping[str, Any]) -> dict:
         def merge(current: dict | None) -> dict:
             if current is None:
                 raise ControlError("账户已删除")
-            if current.get("cookies") != existing.get("cookies") or current.get("read_payload") != existing.get("read_payload"):
+            if any(current.get(name) != existing.get(name) for name in ("cookies", "headers", "read_payload", "credential_revision")):
                 raise ControlError("账户登录态已更新，刷新后重新自动取参")
             merged = _merge_accounts(current, account)
             merged.note = ""
             merged.last_ok_at = account.last_ok_at
+            merged.extra["credential_revision"] = uuid4().hex
             return merged.to_dict()
 
         ctx.store.mutate_account(account_id, merge, "control: capture read payload")

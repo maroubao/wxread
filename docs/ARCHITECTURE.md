@@ -66,6 +66,8 @@ read/warm 共享 wxread-session 并发组。control 按 session 分组；不同�
 
 账户 id 从稳定 wr_vid 派生。同号重绑更新凭据并保留人工设置；停用账户重绑后仍需手动启用。
 
+每次扫码/自动取参成功更新 credential_revision，即使 Cookie 或参数值相同也能识别新的成功会话。旧数据没有该字段仍兼容。运行开始时重新读取会话字段，保留该批已规划的目标；运行中身份或参数更新则停止旧 Reader，并保护新健康状态。
+
 旧配置只在首次空状态时迁移，完成后在加密设置写 legacy_import_disabled。显式删除账户前也设置此标记，避免最后一个账户删除后被旧 Secret 重建；worker 的运行时回写只接受仍在状态分支的账户。
 
 WXREAD_STATE_KEY 是随机 32 字节对称密钥；WXREAD_CONTROL_SK 是独立指令私钥；control.json 存对应公钥。页面只需要 token 和状态密钥。正常升级保持密钥/版本不变，当前没有全量密钥轮换或跨仓库重新加密工具。
